@@ -321,13 +321,18 @@ if(WIN32)
         endif()
     endforeach()
 
-    # Copy vcpkg runtime DLLs
-    add_custom_command(TARGET lfs_py POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different
-            "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/bin"
-            "${CMAKE_CURRENT_BINARY_DIR}"
-        COMMENT "Copying vcpkg DLLs to Python module directory"
-    )
+    if(DEFINED VCPKG_TARGET_TRIPLET)
+        set(_LFS_VCPKG_RUNTIME_BIN_DIR "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/bin")
+        if(EXISTS "${_LFS_VCPKG_RUNTIME_BIN_DIR}")
+            add_custom_command(TARGET lfs_py POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different
+                    "${_LFS_VCPKG_RUNTIME_BIN_DIR}"
+                    "${CMAKE_CURRENT_BINARY_DIR}"
+                COMMENT "Copying vcpkg DLLs to Python module directory"
+            )
+        endif()
+        unset(_LFS_VCPKG_RUNTIME_BIN_DIR)
+    endif()
 
     # Copy nvimgcodec
     if(TARGET nvimgcodec)
@@ -377,6 +382,8 @@ if(BUILD_PYTHON_STUBS)
             # Python 3.8+ on Windows requires os.add_dll_directory() for DLL loading
             # Create a wrapper script that sets up DLL paths before running stubgen
             # Use file(GENERATE) to evaluate generator expressions at generation time
+            set(_LFS_STUBGEN_PREFIX_PATHS "${CMAKE_PREFIX_PATH}")
+            string(REPLACE "\\" "/" _LFS_STUBGEN_PREFIX_PATHS "${_LFS_STUBGEN_PREFIX_PATHS}")
             set(STUBGEN_WRAPPER "${CMAKE_CURRENT_BINARY_DIR}/run_stubgen_$<CONFIG>.py")
             file(GENERATE OUTPUT "${STUBGEN_WRAPPER}" CONTENT "
 import os, pathlib, sys
@@ -395,6 +402,11 @@ dll_dirs = [
     r'${CUDAToolkit_BIN_DIR}',
     r'${CUDAToolkit_BIN_DIR}/x64',
 ]
+
+for prefix in r'${_LFS_STUBGEN_PREFIX_PATHS}'.split(';'):
+    if prefix:
+        dll_dirs.append(prefix)
+        dll_dirs.append(os.path.join(prefix, 'bin'))
 
 for d in dll_dirs:
     if os.path.isdir(d):

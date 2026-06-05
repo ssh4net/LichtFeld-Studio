@@ -254,8 +254,15 @@ target_sources(lfs_visualizer
         rendering/vksplat_viewport_renderer.cpp
         rendering/vulkan_external_tensor.cpp
         rendering/point_cloud_vulkan_renderer.cpp)
-set(glslang_DIR "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/share/glslang"
-    CACHE PATH "Path to vcpkg-installed glslang config" FORCE)
+if((NOT DEFINED glslang_DIR OR "${glslang_DIR}" STREQUAL "") AND DEFINED VCPKG_TARGET_TRIPLET)
+    set(_LFS_VCPKG_GLSLANG_DIR "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/share/glslang")
+    if(EXISTS "${_LFS_VCPKG_GLSLANG_DIR}/glslangConfig.cmake"
+        OR EXISTS "${_LFS_VCPKG_GLSLANG_DIR}/glslang-config.cmake")
+        set(glslang_DIR "${_LFS_VCPKG_GLSLANG_DIR}"
+            CACHE PATH "Path to vcpkg-installed glslang config" FORCE)
+    endif()
+    unset(_LFS_VCPKG_GLSLANG_DIR)
+endif()
 find_package(glslang CONFIG REQUIRED)
 
 add_executable(lfs_shader_compiler EXCLUDE_FROM_ALL

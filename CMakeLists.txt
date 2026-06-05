@@ -2,16 +2,31 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# windows/linux platform independent
-set(RAW_VCPKG_PATH $ENV{VCPKG_ROOT})
-file(TO_CMAKE_PATH "${RAW_VCPKG_PATH}" VCPKG_ROOT)
-
-if ("${CMAKE_TOOLCHAIN_FILE}" STREQUAL "")
-    message(STATUS "user didn't specify CMAKE_TOOLCHAIN_FILE manually, so let's use default -> ${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake")
-    set(CMAKE_TOOLCHAIN_FILE "${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake")
-endif()
-
 cmake_minimum_required(VERSION 3.30)
+
+# Use vcpkg automatically only when the user has actually provided a vcpkg
+# checkout. Otherwise leave normal CMake package discovery alone so
+# CMAKE_PREFIX_PATH, <Package>_DIR, and system paths can be used.
+if(NOT DEFINED CMAKE_TOOLCHAIN_FILE OR "${CMAKE_TOOLCHAIN_FILE}" STREQUAL "")
+    set(RAW_VCPKG_PATH "$ENV{VCPKG_ROOT}")
+    if(CMAKE_PREFIX_PATH)
+        message(STATUS "CMAKE_PREFIX_PATH is set and no CMAKE_TOOLCHAIN_FILE was provided; using normal CMake package discovery")
+    elseif(NOT "${RAW_VCPKG_PATH}" STREQUAL "")
+        file(TO_CMAKE_PATH "${RAW_VCPKG_PATH}" VCPKG_ROOT)
+        set(_LFS_DEFAULT_VCPKG_TOOLCHAIN "${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake")
+        if(EXISTS "${_LFS_DEFAULT_VCPKG_TOOLCHAIN}")
+            message(STATUS "user didn't specify CMAKE_TOOLCHAIN_FILE manually, using VCPKG_ROOT -> ${_LFS_DEFAULT_VCPKG_TOOLCHAIN}")
+            set(CMAKE_TOOLCHAIN_FILE "${_LFS_DEFAULT_VCPKG_TOOLCHAIN}" CACHE FILEPATH "CMake toolchain file" FORCE)
+        else()
+            message(WARNING
+                "VCPKG_ROOT is set to '${VCPKG_ROOT}', but '${_LFS_DEFAULT_VCPKG_TOOLCHAIN}' does not exist. "
+                "Continuing without a toolchain; set CMAKE_PREFIX_PATH or CMAKE_TOOLCHAIN_FILE explicitly.")
+        endif()
+        unset(_LFS_DEFAULT_VCPKG_TOOLCHAIN)
+    else()
+        message(STATUS "No CMAKE_TOOLCHAIN_FILE or VCPKG_ROOT set; using normal CMake package discovery")
+    endif()
+endif()
 
 option(LFS_ENFORCE_LINUX_GUI_BACKENDS "Fail configure when Linux SDL3 would lack X11 and Wayland support" ON)
 
