@@ -67,6 +67,10 @@ namespace lfs::vis {
             // Optional per-transform visibility (size matches model_transforms).
             const std::vector<bool>* node_visibility_mask = nullptr;
 
+            // Optional per-point soft-delete mask. Nonzero entries are hidden.
+            const lfs::core::Tensor* deleted_mask = nullptr;
+            std::uint64_t deleted_mask_revision = 0;
+
             // Optional selection overlays. Masks are per-point UInt8/Bool tensors
             // where 0 means unselected and nonzero means selection group/preview.
             const lfs::core::Tensor* selection_mask = nullptr;
