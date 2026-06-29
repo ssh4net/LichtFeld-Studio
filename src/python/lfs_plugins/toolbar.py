@@ -11,6 +11,7 @@ from .selection_controls import SelectionControlsController
 from .tools import ToolRegistry
 from .transform_controls import TransformControlsController
 from .ui import RuntimeState
+from .viewport_export_controls import ViewportExportControlsController
 
 try:
     from .ui import native_value as _native_store_value
@@ -79,6 +80,23 @@ def _ui_label(key, fallback=""):
     return fallback or ""
 
 
+def _current_selected_node_types() -> tuple[str, ...]:
+    try:
+        import lichtfeld as lf
+
+        scene = lf.scene.current()
+        selected_names = lf.get_selected_node_names() or []
+        node_types: list[str] = []
+        for name in selected_names:
+            node = scene.get_node(name)
+            node_type = getattr(getattr(node, "type", None), "name", "")
+            if node_type:
+                node_types.append(node_type)
+        return tuple(node_types)
+    except Exception:
+        return ()
+
+
 def _keymap_shortcut(action_id, fallback=""):
     if not action_id:
         return fallback or ""
@@ -120,6 +138,7 @@ def _panel_enabled(panel_id):
 def _button_record(button_id, action, value, icon_src, *,
                    tooltip_key="", tooltip_text="", action_id="",
                    shortcut_text="", selected=False, enabled=True):
+    enabled = bool(enabled)
     return {
         "button_id": button_id,
         "action": action,
@@ -130,6 +149,7 @@ def _button_record(button_id, action, value, icon_src, *,
         "shortcut_text": _keymap_shortcut(action_id, shortcut_text),
         "selected": selected,
         "enabled": enabled,
+        "opacity": "1" if enabled else "0.25",
     }
 
 
@@ -160,6 +180,8 @@ class _GizmoToolbarController:
         "builtin.select:lasso": "toolbar.lasso_selection",
         "builtin.select:rings": "toolbar.ring_selection",
         "builtin.select:color": "toolbar.color_selection",
+        "builtin.select:box": "toolbar.box_selection",
+        "builtin.select:sphere": "toolbar.sphere_selection",
         "builtin.translate:local": "toolbar.local_space",
         "builtin.translate:world": "toolbar.world_space",
         "builtin.rotate:local": "toolbar.local_space",
@@ -178,6 +200,8 @@ class _GizmoToolbarController:
         "lasso": "SELECT_MODE_LASSO",
         "rings": "SELECT_MODE_RINGS",
         "color": "SELECT_MODE_COLOR",
+        "box": "SELECT_MODE_BOX",
+        "sphere": "SELECT_MODE_SPHERE",
     }
 
     _PIVOT_LOCALE_KEYS = {
@@ -193,12 +217,28 @@ class _GizmoToolbarController:
     _PIVOT_IDS = {"origin": 0, "bounds": 1}
     _CROP_OBJECT_SHAPES = ("box", "ellipsoid")
     _CROP_TRANSFORM_GIZMOS = ("translate", "rotate", "scale")
+    _SELECTION_VOLUME_MODES = {"box", "sphere"}
 
     def __init__(self):
         self.reset()
 
     def reset(self):
         self._was_hidden = False
+
+    def _active_selection_submode(self):
+        import lichtfeld as lf
+
+        active_submode = _native_store_value("active_submode", _MISSING)
+        if active_submode is _MISSING:
+            get_active_submode = getattr(lf.ui, "get_active_submode", None)
+            active_submode = get_active_submode() if callable(get_active_submode) else ""
+        return active_submode or ""
+
+    def _selection_volume_active(self, active_tool_id):
+        return (
+            active_tool_id == "builtin.select"
+            and self._active_selection_submode() in self._SELECTION_VOLUME_MODES
+        )
 
     def snapshot(self):
         import lichtfeld as lf
@@ -210,14 +250,15 @@ class _GizmoToolbarController:
                 ToolRegistry.clear_active()
             self._was_hidden = True
             return {
-                "show_selection_toolbar": False,
                 "show_transform_toolbar": False,
                 "show_mirror_toolbar": False,
                 "show_crop_toolbar": False,
+                "show_selection_volume_gizmos": False,
                 "show_transform_space_controls": False,
                 "show_transform_pivot_controls": False,
                 "selection_group_buttons": [],
                 "selection_mode_buttons": [],
+                "selection_volume_gizmo_buttons": [],
                 "transform_group_buttons": [],
                 "transform_tool_buttons": [],
                 "mirror_group_buttons": [],
@@ -238,6 +279,11 @@ class _GizmoToolbarController:
             active_tool_id = lf.ui.get_active_tool() or ""
         else:
             active_tool_id = active_tool_id or ""
+        selected_getter = getattr(lf, "get_selected_node_names", None)
+        try:
+            selected_nodes = tuple(selected_getter() or []) if callable(selected_getter) else ()
+        except Exception:
+            selected_nodes = ()
         tool_defs = ToolRegistry.get_all()
         tool_def = ToolRegistry.get(active_tool_id) if active_tool_id else None
         select_tool_def = ToolRegistry.get("builtin.select")
@@ -271,27 +317,30 @@ class _GizmoToolbarController:
         )
         mirror_group_buttons = self._build_mirror_records(mirror_tool_def, active_tool_id, context)
         crop_group_buttons = self._build_crop_group_records(crop_tool_def, active_tool_id, context)
-        crop_object_buttons = self._build_crop_object_records(active_tool_id)
-        crop_transform_buttons = self._build_crop_transform_records(active_tool_id)
-        crop_action_buttons = self._build_crop_action_records(active_tool_id)
+        crop_tool_active = active_tool_id == self._CROP_TOOL_ID
+        selection_volume_active = self._selection_volume_active(active_tool_id)
+        crop_object_buttons = self._build_crop_object_records(active_tool_id) if crop_tool_active else []
+        crop_transform_buttons = self._build_crop_transform_records(active_tool_id) if crop_tool_active else []
+        crop_action_buttons = self._build_crop_action_records(active_tool_id) if crop_tool_active else []
+        selection_volume_gizmo_buttons = self._build_selection_volume_gizmo_records(active_tool_id)
         submode_buttons = self._build_submode_records(active_tool_id, tool_def)
         pivot_buttons = self._build_pivot_records(tool_def)
 
         return {
-            "show_selection_toolbar": (
-                active_tool_id == "builtin.select" and bool(selection_group_buttons) and bool(selection_mode_buttons)
-            ),
             "show_transform_toolbar": (
                 active_tool_id in self._TRANSFORM_TOOL_IDS and
+                not selected_nodes and
                 bool(transform_group_buttons) and
                 bool(transform_tool_buttons)
             ),
             "show_mirror_toolbar": active_tool_id == self._MIRROR_TOOL_ID and bool(submode_buttons),
-            "show_crop_toolbar": active_tool_id == self._CROP_TOOL_ID and bool(crop_object_buttons),
+            "show_crop_toolbar": crop_tool_active and bool(crop_object_buttons),
+            "show_selection_volume_gizmos": selection_volume_active and bool(selection_volume_gizmo_buttons),
             "show_transform_space_controls": active_tool_id in self._TRANSFORM_TOOL_IDS and bool(submode_buttons),
             "show_transform_pivot_controls": active_tool_id in self._TRANSFORM_TOOL_IDS and bool(pivot_buttons),
             "selection_group_buttons": selection_group_buttons,
             "selection_mode_buttons": selection_mode_buttons,
+            "selection_volume_gizmo_buttons": selection_volume_gizmo_buttons,
             "transform_group_buttons": transform_group_buttons,
             "transform_tool_buttons": transform_tool_buttons,
             "mirror_group_buttons": mirror_group_buttons,
@@ -461,6 +510,9 @@ class _GizmoToolbarController:
         active_gizmo = lf.ui.get_gizmo_type() if active and hasattr(lf.ui, "get_gizmo_type") else ""
         if active and not active_gizmo:
             active_gizmo = "translate"
+        return self._build_gizmo_operation_records(active, active_gizmo)
+
+    def _build_gizmo_operation_records(self, active, active_gizmo):
         specs = (
             ("translate", "translation", "toolbar.translate", "Translate"),
             ("rotate", "rotation", "toolbar.rotate", "Rotate"),
@@ -479,6 +531,16 @@ class _GizmoToolbarController:
             )
             for mode, icon, tooltip_key, label in specs
         ]
+
+    def _build_selection_volume_gizmo_records(self, active_tool_id):
+        if not self._selection_volume_active(active_tool_id):
+            return []
+        import lichtfeld as lf
+
+        active_gizmo = ""
+        if hasattr(lf.ui, "get_crop_tool_operation"):
+            active_gizmo = lf.ui.get_crop_tool_operation()
+        return self._build_gizmo_operation_records(True, active_gizmo or "scale")
 
     def _build_crop_action_records(self, active_tool_id):
         active = active_tool_id == self._CROP_TOOL_ID
@@ -518,6 +580,13 @@ class _GizmoToolbarController:
 
     def _activate_crop_tool(self, gizmo_type="translate"):
         import lichtfeld as lf
+
+        if self._active_crop_shape() == "box":
+            selected = lf.get_selected_node_names() or []
+            if selected:
+                add_cropbox = getattr(lf.ui, "add_cropbox", None)
+                if callable(add_cropbox):
+                    add_cropbox(selected[0])
 
         lf.ui.set_active_operator(self._CROP_TOOL_ID, gizmo_type)
 
@@ -613,7 +682,10 @@ class _GizmoToolbarController:
             if lf.ui.get_active_tool() == value:
                 ToolRegistry.clear_active()
             else:
-                ToolRegistry.set_active(value)
+                if value == self._CROP_TOOL_ID:
+                    self._activate_crop_tool("translate")
+                else:
+                    ToolRegistry.set_active(value)
             return
 
         if action == "crop_object":
@@ -627,19 +699,34 @@ class _GizmoToolbarController:
 
         if action == "crop_transform":
             if value in self._CROP_TRANSFORM_GIZMOS:
+                if self._selection_volume_active(lf.ui.get_active_tool()):
+                    set_operation = getattr(lf.ui, "set_crop_tool_operation", None)
+                    if callable(set_operation):
+                        set_operation(value)
+                    return
                 self._activate_crop_tool(value)
             return
 
         if action == "crop_trim":
+            if self._active_crop_shape() == "box":
+                fit_cropbox = getattr(lf.ui, "fit_cropbox_to_scene", None)
+                if callable(fit_cropbox):
+                    fit_cropbox(True)
+                    return
             fit_crop = getattr(lf.ui, "fit_crop_tool", None)
             if callable(fit_crop):
                 fit_crop(True)
             return
 
         if action == "crop_apply":
-            apply_crop = getattr(lf.ui, "apply_crop_tool", None)
-            if callable(apply_crop):
-                apply_crop()
+            if self._active_crop_shape() == "box":
+                apply_cropbox = getattr(lf.ui, "apply_cropbox", None)
+                if callable(apply_cropbox):
+                    apply_cropbox()
+                    return
+            apply_crop_tool = getattr(lf.ui, "apply_crop_tool", None)
+            if callable(apply_crop_tool):
+                apply_crop_tool()
             return
 
         if action == "submode":
@@ -687,7 +774,6 @@ class _GizmoToolbarController:
 
 
 class _UtilityToolbarController:
-    _ASSET_MANAGER_PANEL_ID = "lfs.asset_manager"
     _INPUT_SETTINGS_PANEL_ID = "lfs.input_settings"
     _PLUGIN_MARKETPLACE_PANEL_ID = "lfs.plugin_marketplace"
     _CAMERA_MODE_SPECS = (
@@ -695,30 +781,21 @@ class _UtilityToolbarController:
         ("world", "trackball", "Free Orbit Camera"),
         ("camera-fpv", "fpv", "Fly Camera"),
     )
-    _RENDER_MODE_SPECS = (
-        ("blob", "splats", "toolbar.splat_rendering", "Splat Rendering"),
-        ("dots-diagonal", "points", "toolbar.point_cloud", "Point Cloud"),
-        ("ring", "rings", "toolbar.gaussian_rings", "Gaussian Rings"),
-        ("circle-dot", "centers", "toolbar.center_markers", "Center Markers"),
-    )
     _PRIMARY_ACTIONS = {
         "home": "CAMERA_RESET_HOME",
-        "fullscreen": "TOGGLE_FULLSCREEN",
-        "toggle_ui": "TOGGLE_UI",
+        "focus_selection": "CAMERA_FOCUS_SELECTION",
     }
 
-    def __init__(self):
-        self.reset()
+    def __init__(self, viewport_export_visible=None):
+        self._viewport_export_visible = viewport_export_visible
 
-    def reset(self):
-        self._active_group = ""
-
-    @property
-    def active_group(self):
-        return self._active_group
-
-    def close_group(self):
-        self._active_group = ""
+    def _is_viewport_export_visible(self):
+        if not callable(self._viewport_export_visible):
+            return False
+        try:
+            return bool(self._viewport_export_visible())
+        except Exception:
+            return False
 
     def snapshot(self):
         import lichtfeld as lf
@@ -733,26 +810,12 @@ class _UtilityToolbarController:
         if camera_mode == "turntable":
             camera_mode = "trackball"
 
-        try:
-            camera_view_snap = bool(lf.get_camera_view_snap_enabled())
-        except Exception:
-            camera_view_snap = False
-
         has_render_manager = True
         try:
-            mode_map = {
-                "splats": lf.RenderMode.SPLATS,
-                "points": lf.RenderMode.POINTS,
-                "rings": lf.RenderMode.RINGS,
-                "centers": lf.RenderMode.CENTERS,
-            }
-            render_mode = lf.get_render_mode()
+            lf.get_render_mode()
         except Exception:
             has_render_manager = False
-            mode_map = {}
-            render_mode = None
 
-        is_fullscreen = lf.is_fullscreen() if hasattr(lf, "is_fullscreen") else False
         camera_mode_buttons = [
             _button_record(
                 f"util-camera-{mode_id}",
@@ -770,24 +833,16 @@ class _UtilityToolbarController:
                            tooltip_text="Home",
                            action_id=self._PRIMARY_ACTIONS["home"]),
             _button_record(
-                "util-fullscreen",
-                "fullscreen",
+                "util-focus-selection",
+                "focus_selection",
                 "",
-                _icon_src("arrows-minimize" if is_fullscreen else "arrows-maximize"),
-                tooltip_key="toolbar.fullscreen",
-                tooltip_text="Fullscreen",
-                action_id=self._PRIMARY_ACTIONS["fullscreen"],
-                selected=is_fullscreen,
+                _icon_src("focus-selection"),
+                tooltip_key="toolbar.focus_selection",
+                tooltip_text="Focus Selection",
+                action_id=self._PRIMARY_ACTIONS["focus_selection"],
             ),
-            _button_record("util-toggle-ui", "toggle_ui", "", _icon_src("layout-off"),
-                           tooltip_key="toolbar.toggle_ui",
-                           tooltip_text="Toggle UI",
-                           action_id=self._PRIMARY_ACTIONS["toggle_ui"]),
         ]
 
-        render_mode_buttons = []
-        render_group_buttons = []
-        projection_buttons = []
         utility_extra_buttons = [
             _button_record(
                 "util-input-settings",
@@ -799,13 +854,13 @@ class _UtilityToolbarController:
                 selected=_panel_enabled(self._INPUT_SETTINGS_PANEL_ID),
             ),
             _button_record(
-                "util-asset-manager",
-                "toggle_panel",
-                self._ASSET_MANAGER_PANEL_ID,
-                _icon_src("archive"),
-                tooltip_key="toolbar.asset_manager",
-                tooltip_text="Asset Manager",
-                selected=_panel_enabled(self._ASSET_MANAGER_PANEL_ID),
+                "util-viewport-export",
+                "toggle_viewport_export",
+                "",
+                _icon_src("sequencer/export"),
+                tooltip_key="toolbar.viewport_export",
+                tooltip_text="Viewport Export",
+                selected=self._is_viewport_export_visible(),
             ),
             _button_record(
                 "util-plugin-marketplace",
@@ -819,78 +874,12 @@ class _UtilityToolbarController:
         ]
         utility_bottom_buttons = []
         if has_render_manager:
-            for icon_name, mode_id, tooltip_key, tooltip_text in self._RENDER_MODE_SPECS:
-                render_mode_buttons.append(
-                    _button_record(
-                        f"util-render-{mode_id}",
-                        "set_render_mode",
-                        mode_id,
-                        _icon_src(icon_name),
-                        tooltip_key=tooltip_key,
-                        tooltip_text=tooltip_text,
-                        selected=render_mode == mode_map.get(mode_id),
-                    )
-                )
-
-            active_render_button = next((b for b in render_mode_buttons if b["selected"]), render_mode_buttons[0])
-            render_group_buttons.append(
-                _button_record(
-                    "group-render-mode",
-                    "render_group",
-                    "",
-                    active_render_button["icon_src"],
-                    tooltip_text="Render Modes",
-                    selected=self._active_group == "render",
-                )
-            )
-
-            is_ortho = lf.is_orthographic()
-            projection_buttons.append(
-                _button_record(
-                    "util-projection",
-                    "toggle_projection",
-                    "",
-                    _icon_src("box" if is_ortho else "perspective"),
-                    tooltip_key="toolbar.orthographic" if is_ortho else "toolbar.perspective",
-                    tooltip_text="Orthographic" if is_ortho else "Perspective",
-                    selected=is_ortho,
-                )
-            )
-            projection_buttons.append(
-                _button_record(
-                    "util-view-snap",
-                    "toggle_camera_view_snap",
-                    "",
-                    _icon_src("check"),
-                    tooltip_text="Snap Axis Views",
-                    selected=camera_view_snap,
-                )
-            )
-            projection_buttons.append(
-                _button_record(
-                    "util-split-view",
-                    "toggle_independent_split_view",
-                    "",
-                    _icon_src("layout-columns"),
-                    tooltip_text="Independent Split View",
-                    action_id="toggle_independent_split_view",
-                    selected=lf.ui.get_split_view_mode() == "independent_dual",
-                )
-            )
-            depth_view_active = bool(lf.get_depth_view()) if hasattr(lf, "get_depth_view") else False
-            projection_buttons.append(
-                _button_record(
-                    "util-depth-view",
-                    "toggle_depth_view",
-                    "",
-                    _icon_src("depth-map"),
-                    tooltip_key="toolbar.depth_map",
-                    tooltip_text="Depth Map",
-                    selected=depth_view_active,
-                )
-            )
-
             seq_visible = lf.ui.is_sequencer_visible()
+            # The sequencer is disabled while training is active (the native
+            # SequencerPanel gates on EditorContext::isToolsDisabled). Reflect
+            # that in the button so it greys out instead of appearing live but
+            # doing nothing on press, matching the editing-tool buttons.
+            seq_enabled = RuntimeState.trainer_state.value not in _TOOLBAR_HIDDEN_STATES
             utility_extra_buttons.append(
                 _button_record(
                     "util-sequencer",
@@ -900,26 +889,7 @@ class _UtilityToolbarController:
                     tooltip_key="toolbar.sequencer",
                     tooltip_text="Sequencer",
                     selected=seq_visible,
-                )
-            )
-
-        vram_profiler_available = (
-            hasattr(lf, "get_vram_profiler_enabled") and
-            hasattr(lf, "set_vram_profiler_enabled")
-        )
-        if vram_profiler_available:
-            try:
-                vram_profiler_enabled = bool(lf.get_vram_profiler_enabled())
-            except Exception:
-                vram_profiler_enabled = False
-            utility_bottom_buttons.append(
-                _button_record(
-                    "util-vram-profiler",
-                    "toggle_vram_profiler",
-                    "",
-                    _icon_src("gpu"),
-                    tooltip_text="VRAM Diagnostics",
-                    selected=vram_profiler_enabled,
+                    enabled=seq_enabled,
                 )
             )
 
@@ -936,17 +906,9 @@ class _UtilityToolbarController:
                 )
             )
 
-        if not render_group_buttons:
-            self._active_group = ""
-
         return {
             "camera_mode_buttons": camera_mode_buttons,
-            "show_render_controls": has_render_manager,
-            "show_render_toolbar": self._active_group == "render" and bool(render_mode_buttons),
             "primary_buttons": primary_buttons,
-            "render_group_buttons": render_group_buttons,
-            "render_mode_buttons": render_mode_buttons,
-            "projection_buttons": projection_buttons,
             "utility_extra_buttons": utility_extra_buttons,
             "utility_bottom_buttons": utility_bottom_buttons,
         }
@@ -954,43 +916,19 @@ class _UtilityToolbarController:
     def dispatch(self, action, value):
         import lichtfeld as lf
 
-        if action == "render_group":
-            self._active_group = "" if self._active_group == "render" else "render"
-            return
-        if action != "set_render_mode":
-            self.close_group()
-
         if action == "set_camera_navigation_mode":
             lf.set_camera_navigation_mode(value)
             return
         if action == "home":
             lf.reset_camera()
             return
-        if action == "fullscreen":
-            lf.toggle_fullscreen()
-            return
-        if action == "toggle_ui":
-            lf.toggle_ui()
-            return
-        if action == "toggle_projection":
-            lf.set_orthographic(not lf.is_orthographic())
-            return
-        if action == "toggle_camera_view_snap":
-            lf.set_camera_view_snap_enabled(not lf.get_camera_view_snap_enabled())
-            return
-        if action == "toggle_independent_split_view":
-            lf.toggle_independent_split_view()
-            return
-        if action == "toggle_depth_view":
-            if hasattr(lf, "set_depth_view") and hasattr(lf, "get_depth_view"):
-                lf.set_depth_view(not lf.get_depth_view())
+        if action == "focus_selection":
+            lf.focus_selection()
             return
         if action == "toggle_sequencer":
+            if RuntimeState.trainer_state.value in _TOOLBAR_HIDDEN_STATES:
+                return
             lf.ui.set_sequencer_visible(not lf.ui.is_sequencer_visible())
-            return
-        if action == "toggle_vram_profiler":
-            if hasattr(lf, "get_vram_profiler_enabled") and hasattr(lf, "set_vram_profiler_enabled"):
-                lf.set_vram_profiler_enabled(not bool(lf.get_vram_profiler_enabled()))
             return
         if action == "toggle_panel":
             if value == "lfs.histogram" and not histogram_mode_available(lf.ui.context()):
@@ -998,41 +936,25 @@ class _UtilityToolbarController:
                 return
             lf.ui.set_panel_enabled(value, not _panel_enabled(value))
             return
-        if action != "set_render_mode":
-            return
-
-        mode_map = {
-            "splats": lf.RenderMode.SPLATS,
-            "points": lf.RenderMode.POINTS,
-            "rings": lf.RenderMode.RINGS,
-            "centers": lf.RenderMode.CENTERS,
-        }
-        render_mode = mode_map.get(value)
-        if render_mode is not None:
-            lf.set_render_mode(render_mode)
 
 
 class _ViewportToolbarController:
     _BOOLEAN_FIELDS = (
-        "show_render_controls",
-        "show_render_toolbar",
-        "show_selection_toolbar",
         "show_transform_toolbar",
         "show_mirror_toolbar",
         "show_crop_toolbar",
+        "show_selection_volume_gizmos",
         "show_transform_space_controls",
         "show_transform_pivot_controls",
     )
     _RECORD_FIELDS = (
         "camera_mode_buttons",
         "utility_primary_buttons",
-        "render_group_buttons",
-        "render_mode_buttons",
-        "projection_buttons",
         "utility_extra_buttons",
         "utility_bottom_buttons",
         "selection_group_buttons",
         "selection_mode_buttons",
+        "selection_volume_gizmo_buttons",
         "transform_group_buttons",
         "transform_tool_buttons",
         "mirror_group_buttons",
@@ -1047,8 +969,11 @@ class _ViewportToolbarController:
 
     def __init__(self):
         self._gizmo = _GizmoToolbarController()
-        self._utility = _UtilityToolbarController()
         self._depth_view_controls = DepthViewControlsController()
+        self._viewport_export_controls = ViewportExportControlsController(
+            self._on_viewport_export_visibility_changed
+        )
+        self._utility = _UtilityToolbarController(lambda: self._viewport_export_controls.visible)
         self._selection_controls = SelectionControlsController()
         self._transform_controls = TransformControlsController()
         self.reset()
@@ -1056,20 +981,19 @@ class _ViewportToolbarController:
     def reset(self):
         self._handle = None
         self._mounted_doc_key = None
+        self._current_doc = None
         self._next_doc_key = getattr(self, "_next_doc_key", 1)
         self._record_cache = {name: None for name in self._RECORD_FIELDS}
         self._last_toolbar_signature = None
-        self._show_render_controls = False
-        self._show_render_toolbar = False
-        self._show_selection_toolbar = False
         self._show_transform_toolbar = False
         self._show_mirror_toolbar = False
         self._show_crop_toolbar = False
+        self._show_selection_volume_gizmos = False
         self._show_transform_space_controls = False
         self._show_transform_pivot_controls = False
         self._gizmo.reset()
-        self._utility.reset()
         self._depth_view_controls.unmount()
+        self._viewport_export_controls.unmount()
         self._selection_controls.unmount()
         self._transform_controls.unmount()
 
@@ -1080,6 +1004,7 @@ class _ViewportToolbarController:
             model.bind_record_list(field)
         model.bind_event("toolbar_action", self._on_toolbar_action)
         self._depth_view_controls.bind_model(model)
+        self._viewport_export_controls.bind_model(model)
         self._selection_controls.bind_model(model)
         self._transform_controls.bind_model(model)
 
@@ -1098,10 +1023,12 @@ class _ViewportToolbarController:
             return dirty_sources
 
         can_update_tool_overlays = hasattr(doc, "get_element_by_id")
+        self._current_doc = doc if can_update_tool_overlays else None
         mount_key = self._mount_key(doc) if can_update_tool_overlays else None
         if mount_key is not None and mount_key != self._mounted_doc_key:
             self._mounted_doc_key = mount_key
             self._depth_view_controls.mount(doc)
+            self._viewport_export_controls.mount(doc)
             self._record_cache = {name: None for name in self._RECORD_FIELDS}
             self._last_toolbar_signature = None
             self._selection_controls.mount(doc)
@@ -1114,7 +1041,14 @@ class _ViewportToolbarController:
             depth_dirty = self._depth_view_controls.update(doc)
             if depth_dirty:
                 dirty_sources.append(f"depth_view_controls:{depth_dirty}")
-            if self._depth_view_controls.visible:
+            viewport_export_dirty = self._viewport_export_controls.update(doc)
+            if viewport_export_dirty:
+                dirty_sources.append(f"viewport_export_controls:{viewport_export_dirty}")
+            if self._viewport_export_controls.visible:
+                self._hide_tool_overlay(doc, "depth-view-block")
+                self._hide_tool_overlay(doc, "selection-block")
+                self._hide_tool_overlay(doc, "transform-block")
+            elif self._depth_view_controls.visible:
                 self._hide_tool_overlay(doc, "selection-block")
                 self._hide_tool_overlay(doc, "transform-block")
             else:
@@ -1130,6 +1064,35 @@ class _ViewportToolbarController:
         element = doc.get_element_by_id(element_id)
         if element:
             element.set_class("hidden", True)
+
+    def _sync_tool_overlays_now(self):
+        doc = self._current_doc
+        if doc is None or not hasattr(doc, "get_element_by_id"):
+            return
+
+        self._depth_view_controls.update(doc)
+        self._viewport_export_controls.update(doc)
+        if self._viewport_export_controls.visible:
+            self._hide_tool_overlay(doc, "depth-view-block")
+            self._hide_tool_overlay(doc, "selection-block")
+            self._hide_tool_overlay(doc, "transform-block")
+        elif self._depth_view_controls.visible:
+            self._hide_tool_overlay(doc, "selection-block")
+            self._hide_tool_overlay(doc, "transform-block")
+
+        try:
+            import lichtfeld as lf
+
+            request_redraw = getattr(lf.ui, "request_redraw", None)
+            if callable(request_redraw):
+                request_redraw()
+        except Exception:
+            pass
+
+    def _on_viewport_export_visibility_changed(self):
+        self._last_toolbar_signature = None
+        self._sync_toolbar_state()
+        self._sync_tool_overlays_now()
 
     def _mount_key(self, doc):
         body = doc.get_element_by_id("overlay-body")
@@ -1156,33 +1119,22 @@ class _ViewportToolbarController:
 
         utility_state = self._utility.snapshot()
         gizmo_state = self._gizmo.snapshot()
-        show_render_toolbar = utility_state["show_render_toolbar"]
 
         dirty = False
-        dirty |= self._sync_flag("show_render_controls", utility_state["show_render_controls"])
-        dirty |= self._sync_flag("show_render_toolbar", show_render_toolbar)
-        dirty |= self._sync_flag("show_selection_toolbar", gizmo_state["show_selection_toolbar"] and not show_render_toolbar)
-        dirty |= self._sync_flag("show_transform_toolbar", gizmo_state["show_transform_toolbar"] and not show_render_toolbar)
-        dirty |= self._sync_flag("show_mirror_toolbar", gizmo_state["show_mirror_toolbar"] and not show_render_toolbar)
-        dirty |= self._sync_flag("show_crop_toolbar", gizmo_state["show_crop_toolbar"] and not show_render_toolbar)
-        dirty |= self._sync_flag(
-            "show_transform_space_controls",
-            gizmo_state["show_transform_space_controls"] and not show_render_toolbar,
-        )
-        dirty |= self._sync_flag(
-            "show_transform_pivot_controls",
-            gizmo_state["show_transform_pivot_controls"] and not show_render_toolbar,
-        )
+        dirty |= self._sync_flag("show_transform_toolbar", gizmo_state["show_transform_toolbar"])
+        dirty |= self._sync_flag("show_mirror_toolbar", gizmo_state["show_mirror_toolbar"])
+        dirty |= self._sync_flag("show_crop_toolbar", gizmo_state["show_crop_toolbar"])
+        dirty |= self._sync_flag("show_selection_volume_gizmos", gizmo_state["show_selection_volume_gizmos"])
+        dirty |= self._sync_flag("show_transform_space_controls", gizmo_state["show_transform_space_controls"])
+        dirty |= self._sync_flag("show_transform_pivot_controls", gizmo_state["show_transform_pivot_controls"])
 
         dirty |= self._sync_records("camera_mode_buttons", utility_state["camera_mode_buttons"])
         dirty |= self._sync_records("utility_primary_buttons", utility_state["primary_buttons"])
-        dirty |= self._sync_records("render_group_buttons", utility_state["render_group_buttons"])
-        dirty |= self._sync_records("render_mode_buttons", utility_state["render_mode_buttons"])
-        dirty |= self._sync_records("projection_buttons", utility_state["projection_buttons"])
         dirty |= self._sync_records("utility_extra_buttons", utility_state["utility_extra_buttons"])
         dirty |= self._sync_records("utility_bottom_buttons", utility_state["utility_bottom_buttons"])
         dirty |= self._sync_records("selection_group_buttons", gizmo_state["selection_group_buttons"], doc)
         dirty |= self._sync_records("selection_mode_buttons", gizmo_state["selection_mode_buttons"], doc)
+        dirty |= self._sync_records("selection_volume_gizmo_buttons", gizmo_state["selection_volume_gizmo_buttons"])
         dirty |= self._sync_records("transform_group_buttons", gizmo_state["transform_group_buttons"])
         dirty |= self._sync_records("transform_tool_buttons", gizmo_state["transform_tool_buttons"])
         dirty |= self._sync_records("mirror_group_buttons", gizmo_state["mirror_group_buttons"])
@@ -1285,6 +1237,7 @@ class _ViewportToolbarController:
         active_submode = active_submode or ""
         gizmo_type = call("", getattr(lf.ui, "get_gizmo_type", None))
         crop_shape = call("box", getattr(lf.ui, "get_crop_tool_shape", None))
+        crop_operation = call("translate", getattr(lf.ui, "get_crop_tool_operation", None))
         transform_space = _native_store_value("transform_space", _MISSING)
         if transform_space is _MISSING:
             transform_space = call(1, getattr(lf.ui, "get_transform_space", None))
@@ -1305,22 +1258,14 @@ class _ViewportToolbarController:
             else bool(call(False, has_scene_getter)) if callable(has_scene_getter) else False
         )
         num_gaussians = int(getattr(ui_context, "num_gaussians", 0) or 0)
+        has_selection = bool(getattr(ui_context, "has_selection", False)) if ui_context is not None else False
         selected_getter = getattr(lf, "get_selected_node_names", None)
         selected_nodes = tuple(call([], selected_getter) or []) if callable(selected_getter) else ()
+        selected_node_types = _current_selected_node_types()
+        can_transform_selection = bool(
+            call(False, getattr(lf, "can_transform_selection", None))
+        )
 
-        render_mode = call(None, lf.get_render_mode) if hasattr(lf, "get_render_mode") else None
-        vram_profiler_enabled = (
-            bool(call(False, getattr(lf, "get_vram_profiler_enabled", None)))
-            if hasattr(lf, "get_vram_profiler_enabled")
-            else False
-        )
-        asset_manager_enabled = bool(
-            call(
-                False,
-                getattr(lf.ui, "is_panel_enabled", None),
-                _UtilityToolbarController._ASSET_MANAGER_PANEL_ID,
-            )
-        )
         input_settings_enabled = bool(
             call(
                 False,
@@ -1337,28 +1282,24 @@ class _ViewportToolbarController:
         )
         return (
             trainer_state,
-            self._utility.active_group,
             active_tool,
             active_submode,
             gizmo_type,
             crop_shape,
+            crop_operation,
             transform_space,
             pivot_mode,
             has_scene,
             num_gaussians,
+            has_selection,
             selected_nodes,
+            selected_node_types,
+            can_transform_selection,
             tool_ids,
             str(call("orbit", lf.get_camera_navigation_mode)).lower() if hasattr(lf, "get_camera_navigation_mode") else "orbit",
-            bool(call(False, lf.get_camera_view_snap_enabled)) if hasattr(lf, "get_camera_view_snap_enabled") else False,
-            str(render_mode),
-            bool(call(False, lf.is_orthographic)) if hasattr(lf, "is_orthographic") else False,
-            bool(call(False, lf.is_fullscreen)) if hasattr(lf, "is_fullscreen") else False,
-            call("", getattr(lf.ui, "get_split_view_mode", None)),
-            bool(call(False, lf.get_depth_view)) if hasattr(lf, "get_depth_view") else False,
+            self._viewport_export_controls.visible,
             bool(call(False, getattr(lf.ui, "is_sequencer_visible", None))),
-            vram_profiler_enabled,
             bool(histogram_mode_available(ui_context)) if ui_context is not None else False,
-            asset_manager_enabled,
             input_settings_enabled,
             plugin_marketplace_enabled,
             bool(call(False, getattr(lf.ui, "is_panel_enabled", None), "lfs.histogram")),
@@ -1369,6 +1310,13 @@ class _ViewportToolbarController:
             return
         action = str(args[0])
         value = str(args[1]) if len(args) > 1 else ""
+        if action == "toggle_viewport_export":
+            self._gizmo.clear_active_horizontal_tool()
+            self._viewport_export_controls.toggle(notify=False)
+            self._last_toolbar_signature = None
+            self._sync_toolbar_state()
+            self._sync_tool_overlays_now()
+            return
         if action in {
             "tool",
             "submode",
@@ -1379,14 +1327,13 @@ class _ViewportToolbarController:
             "crop_trim",
             "crop_apply",
         }:
-            self._utility.close_group()
+            self._viewport_export_controls.close(notify=False)
             self._gizmo.dispatch(action, value)
         else:
-            if action == "render_group" and self._utility.active_group != "render":
-                self._gizmo.clear_active_horizontal_tool()
             self._utility.dispatch(action, value)
         self._last_toolbar_signature = None
         self._sync_toolbar_state()
+        self._sync_tool_overlays_now()
 
 
 def _ensure_controller():

@@ -228,7 +228,8 @@ namespace lfs::vis::op {
                 }
             }
 
-            if (node->parent_id != desired_parent) {
+            const bool parent_differs = (node->parent_id != desired_parent);
+            if (parent_differs || target.order_index >= 0) {
                 std::string old_parent_name;
                 if (node->parent_id != lfs::core::NULL_NODE) {
                     if (const auto* old_parent = scene.getNodeById(node->parent_id)) {
@@ -236,20 +237,24 @@ namespace lfs::vis::op {
                     }
                 }
 
-                scene.reparent(node->id, desired_parent);
+                // moveNode returns false for a no-op (already at the target slot) as well as a
+                // genuine failure; the parent post-condition below is the authoritative check.
+                (void)scene.moveNode(node->id, desired_parent, target.order_index);
                 node = scene.getMutableNode(current_name);
                 if (!node || node->parent_id != desired_parent) {
                     throw std::runtime_error("Failed to reparent node '" + current_name + "'");
                 }
 
-                scene_manager.invalidateNodeSelectionMask();
-                if (emit_reparent_event) {
-                    NodeReparented{
-                        .name = target.name,
-                        .old_parent = old_parent_name,
-                        .new_parent = target.parent_name,
-                        .from_history = true}
-                        .emit();
+                if (parent_differs) {
+                    scene_manager.invalidateNodeSelectionMask();
+                    if (emit_reparent_event) {
+                        NodeReparented{
+                            .name = target.name,
+                            .old_parent = old_parent_name,
+                            .new_parent = target.parent_name,
+                            .from_history = true}
+                            .emit();
+                    }
                 }
             }
 
@@ -753,6 +758,7 @@ namespace lfs::vis::op {
             snapshot.image_name = camera.image_name();
             snapshot.image_path = camera.image_path();
             snapshot.mask_path = camera.mask_path();
+            snapshot.depth_path = camera.depth_path();
             snapshot.split = camera.split();
             snapshot.focal_x = camera.focal_x();
             snapshot.focal_y = camera.focal_y();
@@ -784,7 +790,8 @@ namespace lfs::vis::op {
                 snapshot.camera_width,
                 snapshot.camera_height,
                 snapshot.uid,
-                snapshot.camera_id);
+                snapshot.camera_id,
+                snapshot.depth_path);
             camera->set_split(snapshot.split);
             camera->set_image_dimensions(snapshot.image_width, snapshot.image_height);
             return camera;
@@ -803,7 +810,16 @@ namespace lfs::vis::op {
             if (node.parent_id != lfs::core::NULL_NODE) {
                 if (const auto* parent = scene_manager.getScene().getNodeById(node.parent_id)) {
                     snapshot.parent_name = parent->name;
+                    const auto& siblings = parent->children;
+                    const auto it = std::find(siblings.begin(), siblings.end(), node.id);
+                    if (it != siblings.end())
+                        snapshot.order_index = static_cast<int>(std::distance(siblings.begin(), it));
                 }
+            } else {
+                const auto roots = scene_manager.getScene().getRootNodes();
+                const auto it = std::find(roots.begin(), roots.end(), node.id);
+                if (it != roots.end())
+                    snapshot.order_index = static_cast<int>(std::distance(roots.begin(), it));
             }
 
             if (auto path = scene_manager.getPlyPath(node.name); path) {
@@ -1107,7 +1123,7 @@ namespace lfs::vis::op {
                 return false;
             }
 
-            auto* restored = scene.getMutableNode(snapshot.name);
+            auto* restored = scene.getNodeById(node_id);
             if (!restored) {
                 return false;
             }
@@ -1120,7 +1136,7 @@ namespace lfs::vis::op {
             restored->transform_dirty = true;
 
             if (snapshot.source_path) {
-                scene_manager.setPlyPath(snapshot.name, *snapshot.source_path);
+                scene_manager.setPlyPath(restored->name, *snapshot.source_path);
             }
 
             for (const auto& child : snapshot.children) {
@@ -1433,14 +1449,25 @@ namespace lfs::vis::op {
                                            }
                                          : selection_after_metadata_;
 
+        auto current_selection = scene_.getScene().getSelectionMask();
+        const size_t current_total = scene_.getScene().getSelectionGaussianCount();
         if (selection_mask_storage_.mode == TensorSwapStorageMode::SPARSE &&
-            scene_.getScene().getTotalGaussianCount() != selection_mask_storage_.total_size) {
-            throw std::runtime_error("Cannot replay sparse selection history after topology changed");
+            current_total != selection_mask_storage_.total_size) {
+            LOG_WARN("Clearing stale sparse selection history after topology changed: scene has {}, history has {}",
+                     current_total,
+                     selection_mask_storage_.total_size);
+
+            lfs::core::Scene::SelectionStateSnapshot snapshot;
+            snapshot.groups = target_metadata.groups;
+            snapshot.active_group_id = target_metadata.active_group_id;
+            snapshot.next_group_id = target_metadata.next_group_id;
+            snapshot.has_selection = false;
+            scene_.getScene().restoreSelectionState(snapshot);
+            return;
         }
 
-        auto current_selection = scene_.getScene().getSelectionMask();
         const size_t total_size = std::max({selection_mask_storage_.total_size,
-                                            scene_.getScene().getTotalGaussianCount(),
+                                            current_total,
                                             tensorNumel(current_selection)});
         auto working_mask = materializeMaskTensor(
             current_selection, total_size, selection_mask_storage_.device, lfs::core::DataType::UInt8);

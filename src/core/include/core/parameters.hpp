@@ -22,10 +22,11 @@ namespace lfs::core {
     namespace param {
         // Mask mode for attention mask behavior during training
         enum class MaskMode {
-            None,           // No masking applied
-            Segment,        // Soft penalty to enforce alpha→0 in masked areas
-            Ignore,         // Completely ignore masked regions in loss
-            AlphaConsistent // Enforce exact alpha values from mask
+            None,             // No masking applied
+            Segment,          // Soft penalty to enforce alpha→0 in masked areas
+            Ignore,           // Completely ignore masked regions in loss
+            SegmentAndIgnore, // 3-band mask (0-255): value<128 ignore, 128<=value<=250 segment, value>250 keep
+            AlphaConsistent   // Enforce exact alpha values from mask
         };
 
         // Background mode for training - only one can be active at a time
@@ -126,6 +127,11 @@ namespace lfs::core {
             float mask_opacity_penalty_power = 2.0f;  // Penalty falloff (1=linear, 2=quadratic)
             bool use_alpha_as_mask = true;            // Auto-use alpha channel from RGBA images as mask
 
+            // Depth supervision
+            bool use_depth_loss = false;                        // Use dataset depth maps when available
+            float depth_loss_weight = 2.0f;                     // Depth supervision weight
+            std::string depth_loss_mode = "adaptive-warped-l1"; // pearson or adaptive-warped-l1
+
             // Mip filter (anti-aliasing)
             bool mip_filter = false;
 
@@ -182,9 +188,6 @@ namespace lfs::core {
             bool random = false;        // Use random initialization instead of SfM
             int init_num_pts = 100'000; // Number of random points to initialize
             float init_extent = 3.0f;   // Extent of random point cloud
-
-            // Tile mode for memory-efficient 3DGUT training (ignored for 3DGS/FastGS)
-            int tile_mode = 1;
 
             // Sparsity optimization parameters
             bool enable_sparsity = false;
@@ -272,6 +275,7 @@ namespace lfs::core {
             // Optional trained splats to append to the training model before optimizer initialization
             std::vector<std::filesystem::path> add_splat_paths;
             std::vector<bool> add_splat_freeze;
+            bool exclude_frozen_add_splats_from_export = false;
 
             // Checkpoint to resume training from
             std::optional<std::filesystem::path> resume_checkpoint = std::nullopt;
@@ -297,6 +301,15 @@ namespace lfs::core {
                                   USDC,
                                   RAD };
 
+        // PLY -> RAD only: per-bucket LOD tree builder for the out-of-core
+        // converter. BHATT is the quality-validated default; OCTREE trades
+        // unvalidated quality for a much faster parallel build.
+        enum class LodBuilder { BHATT,
+                                OCTREE };
+
+        enum class RadExportMode { Stream,
+                                   NonStream };
+
         // Parameters for the convert command
         struct LFS_CORE_API ConvertParameters {
             std::filesystem::path input_path;
@@ -304,8 +317,13 @@ namespace lfs::core {
             OutputFormat format = OutputFormat::PLY;
             int sh_degree = 3; // 0-3, -1 = keep original
             int sog_iterations = 10;
-            bool overwrite = false;            // Skip overwrite prompts
-            std::vector<float> rad_lod_levels; // LOD levels for RAD format (as ratios, e.g., 0.5f = 50%)
+            // PLY -> RAD only: replicate the source across an AxB ground-plane
+            // grid instead of pre-tiling the input file.
+            std::uint32_t tiles_x = 1;
+            std::uint32_t tiles_y = 1;
+            LodBuilder lod_builder = LodBuilder::BHATT;
+            RadExportMode rad_export_mode = RadExportMode::Stream;
+            bool overwrite = false; // Skip overwrite prompts
         };
 
         // Parameters for the mesh2splat command
@@ -317,7 +335,6 @@ namespace lfs::core {
             Mesh2SplatOptions options;
             int sog_iterations = 10;
             bool overwrite = false;
-            std::vector<float> rad_lod_levels;
         };
 
         // Modern C++23 functions returning expected values

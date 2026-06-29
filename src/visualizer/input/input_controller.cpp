@@ -6,6 +6,7 @@
 #include "core/event_bridge/localization_manager.hpp"
 #include "core/logger.hpp"
 #include "core/path_utils.hpp"
+#include "core/splat_data_transform.hpp"
 #include "gui/bounds_gizmo.hpp"
 #include "gui/gui_focus_state.hpp"
 #include "gui/gui_manager.hpp"
@@ -48,6 +49,36 @@ namespace lfs::vis {
         constexpr double kCameraContextMenuDragThreshold = 4.0;
         constexpr double kCameraFrustumClickThreshold = 5.0;
         namespace string_keys = lichtfeld::Strings;
+
+        // Expand [world_min, world_max] by a node's local AABB transformed to world
+        // space. With use_percentile, the splat/point-cloud box is the trimmed
+        // (1st/99th percentile) AABB so far-flung floaters don't inflate it; meshes
+        // and other geometry fall back to the full node bounds.
+        void expandNodeWorldBounds(const core::Scene& scene, const core::SceneNode& node,
+                                   glm::vec3& world_min, glm::vec3& world_max,
+                                   bool use_percentile = false) {
+            glm::vec3 local_min, local_max;
+            bool have_local = false;
+            if (use_percentile) {
+                if (node.model && node.model->size() > 0)
+                    have_local = core::compute_bounds(*node.model, local_min, local_max, 0.0f, true);
+                else if (node.point_cloud && node.point_cloud->size() > 0)
+                    have_local = core::compute_bounds(*node.point_cloud, local_min, local_max, 0.0f, true);
+            }
+            if (!have_local && !scene.getNodeBounds(node.id, local_min, local_max))
+                return;
+
+            const glm::mat4 world_xform = scene_coords::nodeVisualizerWorldTransform(scene, node.id);
+            for (int i = 0; i < 8; ++i) {
+                const glm::vec3 corner(
+                    (i & 1) ? local_max.x : local_min.x,
+                    (i & 2) ? local_max.y : local_min.y,
+                    (i & 4) ? local_max.z : local_min.z);
+                const glm::vec3 world_pt = glm::vec3(world_xform * glm::vec4(corner, 1.0f));
+                world_min = glm::min(world_min, world_pt);
+                world_max = glm::max(world_max, world_pt);
+            }
+        }
 
         [[nodiscard]] bool isTransformGizmoOverOrUsing() {
             return gui::isBoundsGizmoHovered() ||
@@ -206,7 +237,34 @@ namespace lfs::vis {
             return python::dispatch_modal_event(py_evt);
         }
 
-        bool handleSelectionModeShortcut(const input::Action action, gui::GuiManager* gui) {
+        std::optional<ToolType> ownerToolForActivationAction(const input::Action action) {
+            switch (action) {
+            case input::Action::TOOL_SELECT:
+            case input::Action::SELECT_MODE_CENTERS:
+            case input::Action::SELECT_MODE_RECTANGLE:
+            case input::Action::SELECT_MODE_POLYGON:
+            case input::Action::SELECT_MODE_LASSO:
+            case input::Action::SELECT_MODE_RINGS:
+            case input::Action::SELECT_MODE_COLOR:
+            case input::Action::SELECT_MODE_BOX:
+            case input::Action::SELECT_MODE_SPHERE:
+                return ToolType::Selection;
+            case input::Action::TOOL_TRANSLATE:
+                return ToolType::Translate;
+            case input::Action::TOOL_ROTATE:
+                return ToolType::Rotate;
+            case input::Action::TOOL_SCALE:
+                return ToolType::Scale;
+            case input::Action::TOOL_MIRROR:
+                return ToolType::Mirror;
+            case input::Action::TOOL_ALIGN:
+                return ToolType::Align;
+            default:
+                return std::nullopt;
+            }
+        }
+
+        bool applySelectionModeShortcut(const input::Action action, gui::GuiManager* gui) {
             if (!gui)
                 return false;
 
@@ -237,6 +295,14 @@ namespace lfs::vis {
                 submode = SelectionSubMode::Color;
                 submode_id = "color";
                 break;
+            case input::Action::SELECT_MODE_BOX:
+                submode = SelectionSubMode::Box;
+                submode_id = "box";
+                break;
+            case input::Action::SELECT_MODE_SPHERE:
+                submode = SelectionSubMode::Sphere;
+                submode_id = "sphere";
+                break;
             default:
                 return false;
             }
@@ -246,33 +312,31 @@ namespace lfs::vis {
             return true;
         }
 
-        bool handleToolbarToolShortcut(const input::Action action) {
-            ToolType tool = ToolType::None;
-            switch (action) {
-            case input::Action::TOOL_SELECT:
-                tool = ToolType::Selection;
-                break;
-            case input::Action::TOOL_TRANSLATE:
-                tool = ToolType::Translate;
-                break;
-            case input::Action::TOOL_ROTATE:
-                tool = ToolType::Rotate;
-                break;
-            case input::Action::TOOL_SCALE:
-                tool = ToolType::Scale;
-                break;
-            case input::Action::TOOL_MIRROR:
-                tool = ToolType::Mirror;
-                break;
-            case input::Action::TOOL_ALIGN:
-                tool = ToolType::Align;
-                break;
-            default:
+        bool handleToolControlActivationShortcut(const input::Action action, gui::GuiManager* gui) {
+            const auto tool = ownerToolForActivationAction(action);
+            if (!tool) {
                 return false;
             }
 
-            lfs::core::events::tools::SetToolbarTool{.tool_mode = static_cast<int>(tool)}.emit();
+            lfs::core::events::tools::SetToolbarTool{.tool_mode = static_cast<int>(*tool)}.emit();
+            (void)applySelectionModeShortcut(action, gui);
             return true;
+        }
+
+        input::Action resolveCrossToolActivationShortcut(const input::InputBindings& bindings,
+                                                         const input::ToolMode current_mode,
+                                                         const int key,
+                                                         const int mods) {
+            for (const auto mode : input::kAllToolModes) {
+                if (mode == current_mode) {
+                    continue;
+                }
+                const auto candidate = bindings.getActionForKey(mode, key, mods);
+                if (ownerToolForActivationAction(candidate).has_value()) {
+                    return candidate;
+                }
+            }
+            return input::Action::NONE;
         }
 
         [[nodiscard]] bool shouldDeferClickActionForDrag(const input::Action action) {
@@ -307,22 +371,31 @@ namespace lfs::vis {
 
         split_toggle_handler_id_ = cmd::ToggleSplitView::when([this](const auto&) {
             clearViewportDragState();
+            clearWasdMomentumViewport();
             focusSplitPanel(SplitViewPanelId::Left);
         });
         independent_split_toggle_handler_id_ = cmd::ToggleIndependentSplitView::when([this](const auto&) {
             clearViewportDragState();
+            clearWasdMomentumViewport();
             focusSplitPanel(SplitViewPanelId::Left);
         });
         gt_comparison_toggle_handler_id_ = cmd::ToggleGTComparison::when([this](const auto&) {
             clearViewportDragState();
+            clearWasdMomentumViewport();
             focusSplitPanel(SplitViewPanelId::Left);
         });
         scene_cleared_handler_id_ = state::SceneCleared::when([this](const auto&) {
             clearViewportDragState();
+            clearWasdMomentumViewport();
+            scene_extent_ = 0.0f;
+            depth_range_initialized_ = false;
             focusSplitPanel(SplitViewPanelId::Left);
         });
         scene_loaded_handler_id_ = state::SceneLoaded::when([this](const auto&) {
             clearViewportDragState();
+            clearWasdMomentumViewport();
+            scene_extent_ = 0.0f;
+            depth_range_initialized_ = false;
             focusSplitPanel(SplitViewPanelId::Left);
         });
 
@@ -332,6 +405,7 @@ namespace lfs::vis {
             press_selected_camera_frustum_ = false;
             pressed_camera_frustum_id_ = -1;
             std::fill(std::begin(keys_movement_), std::end(keys_movement_), false);
+            clearWasdMomentumViewport();
             hovered_camera_id_ = -1;
 
             // Clear ImGui input to prevent tooltip trails
@@ -426,12 +500,9 @@ namespace lfs::vis {
 
         clearViewportDragState();
         camera_navigation_mode_ = mode;
-
-        auto& target_viewport = activeKeyboardViewport();
-        float pivot_distance = glm::length(target_viewport.camera.getPivot() - target_viewport.camera.t);
-        if (!std::isfinite(pivot_distance) || pivot_distance < 0.1f)
-            pivot_distance = 5.0f;
-        target_viewport.camera.updatePivotFromCamera(pivot_distance);
+        // The pivot is left untouched: orbit modes work with any pivot and FPV
+        // re-seeds it on every look drag, so switching modes must not discard a
+        // user-set pivot.
     }
 
     void InputController::onWindowFocusLost() {
@@ -609,16 +680,18 @@ namespace lfs::vis {
             auto time_since_last = std::chrono::duration<double>(now - last_click_time_).count();
             double dist = glm::length(glm::dvec2(x, y) - last_click_pos_);
 
-            constexpr double MOUSE_DOUBLE_CLICK_TIME = 0.5;
-            constexpr double MOUSE_DOUBLE_CLICK_DISTANCE = 10.0;
-
-            bool is_double_click = (time_since_last < MOUSE_DOUBLE_CLICK_TIME &&
-                                    dist < MOUSE_DOUBLE_CLICK_DISTANCE);
+            bool is_double_click = (time_since_last < DOUBLE_CLICK_TIME &&
+                                    dist < DOUBLE_CLICK_DISTANCE);
 
             // If we have a hovered camera, check for double-click. Defer
             // single-click selection until release so orbit drags that start
             // over dataset image frustums do not change the node selection.
-            if (hovered_camera_id_ >= 0 && !over_gizmo && !over_transform_gizmo) {
+            const auto tool_mode = getCurrentToolMode();
+            const bool allow_camera_frustum_pick =
+                tool_mode == input::ToolMode::GLOBAL ||
+                tool_mode == input::ToolMode::SELECTION;
+            if (allow_camera_frustum_pick &&
+                hovered_camera_id_ >= 0 && !over_gizmo && !over_transform_gizmo) {
                 if (is_double_click && hovered_camera_id_ == last_clicked_camera_id_) {
                     cmd::GoToCamView{.cam_id = hovered_camera_id_}.emit();
 
@@ -702,8 +775,11 @@ namespace lfs::vis {
                 return;
             }
 
-            // Block if a transform gizmo is being used or hovered
-            if (over_transform_gizmo) {
+            // Pivot placement is a viewport-global double-click gesture and must
+            // remain available when an editing gizmo is merely hovered. Active
+            // gizmo manipulation still owns the pointer until the drag finishes.
+            if (isTransformGizmoUsing() ||
+                (over_transform_gizmo && bound_action != input::Action::CAMERA_SET_PIVOT)) {
                 return;
             }
 
@@ -769,6 +845,7 @@ namespace lfs::vis {
 
             case input::Action::CAMERA_ORBIT:
                 if (const auto interaction = resolvePanelInteraction(x, y); interaction && interaction->valid()) {
+                    interaction->viewport->camera.finishGlide();
                     interaction->viewport->camera.initScreenPos(glm::vec2(x, y));
                     drag_viewport_ = interaction->viewport;
                     drag_split_panel_ = interaction->panel;
@@ -799,8 +876,13 @@ namespace lfs::vis {
                 }
                 auto& target_viewport = *interaction->viewport;
                 focusSplitPanel(interaction->panel);
-                const glm::vec3 new_pivot = unprojectScreenPoint(x, y);
-                const float current_distance = glm::length(target_viewport.camera.getPivot() - target_viewport.camera.t);
+                target_viewport.camera.finishGlide();
+                float current_distance = glm::length(target_viewport.camera.getPivot() - target_viewport.camera.t);
+                if (!std::isfinite(current_distance) || current_distance < 0.1f)
+                    current_distance = 5.0f;
+                // Background clicks keep the current orbit radius instead of an
+                // arbitrary fixed depth.
+                const glm::vec3 new_pivot = unprojectScreenPoint(x, y, current_distance);
                 const glm::vec3 forward = lfs::rendering::cameraForward(target_viewport.camera.R);
 
                 glm::vec3 camera_offset(0.0f);
@@ -844,8 +926,9 @@ namespace lfs::vis {
                     }
                 }
 
-                target_viewport.camera.t = new_pivot - forward * current_distance + camera_offset;
                 target_viewport.camera.setPivot(new_pivot);
+                target_viewport.camera.startGlide(new_pivot - forward * current_distance + camera_offset);
+                onCameraMovementStart();
                 publishCameraMove(&target_viewport);
                 break;
             }
@@ -853,15 +936,20 @@ namespace lfs::vis {
             case input::Action::SELECTION_REPLACE:
             case input::Action::SELECTION_ADD:
             case input::Action::SELECTION_REMOVE:
+            case input::Action::SELECTION_INTERSECT:
                 if (!over_gui && !over_gizmo && tool_context_ &&
                     !over_transform_gizmo) {
                     if (selection_tool_ && selection_tool_->isEnabled()) {
                         // Invoke selection stroke operator
                         auto* gm = services().guiOrNull();
                         const auto sub_mode = gm ? static_cast<int>(gm->gizmo().getSelectionSubMode()) : 0;
-                        const int selection_op = (bound_action == input::Action::SELECTION_ADD)      ? 1
-                                                 : (bound_action == input::Action::SELECTION_REMOVE) ? 2
-                                                                                                     : 0;
+                        int selection_op = 0;
+                        switch (bound_action) {
+                        case input::Action::SELECTION_ADD: selection_op = 1; break;
+                        case input::Action::SELECTION_REMOVE: selection_op = 2; break;
+                        case input::Action::SELECTION_INTERSECT: selection_op = 3; break;
+                        default: break;
+                        }
 
                         op::OperatorProperties props;
                         props.set("x", x);
@@ -978,7 +1066,12 @@ namespace lfs::vis {
             if (press_consumed_camera_frustum) {
                 const double drag_dist = glm::length(glm::dvec2(x, y) - pressed_camera_frustum_pos);
                 const bool was_click = drag_dist < kCameraFrustumClickThreshold;
-                if (was_click && pressed_camera_frustum_id >= 0 &&
+                const auto tool_mode = getCurrentToolMode();
+                const bool allow_camera_frustum_pick =
+                    tool_mode == input::ToolMode::GLOBAL ||
+                    tool_mode == input::ToolMode::SELECTION;
+                if (allow_camera_frustum_pick &&
+                    was_click && pressed_camera_frustum_id >= 0 &&
                     !over_gui && !over_transform_gizmo) {
                     selectCameraByUid(pressed_camera_frustum_id);
                     if (button == node_rect_button_) {
@@ -1274,19 +1367,20 @@ namespace lfs::vis {
             auto* const target_viewport = drag_viewport_ ? drag_viewport_ : &viewport_;
 
             switch (drag_mode_) {
-            case DragMode::Pan:
-                target_viewport->camera.translate(pos);
+            case DragMode::Pan: {
+                const float current_time = static_cast<float>(SDL_GetTicks() / 1000.0f);
+                target_viewport->camera.panDrag(pos, current_time);
+                pan_coast_viewport_ = target_viewport;
                 break;
+            }
             case DragMode::Rotate:
                 target_viewport->camera.rotateFpv(pos);
                 break;
             case DragMode::Orbit: {
-                float current_time = static_cast<float>(SDL_GetTicks() / 1000.0);
-                if (camera_navigation_mode_ == CameraNavigationMode::Trackball) {
-                    target_viewport->camera.updateTrackballRotateAroundCenter(pos, current_time);
-                } else {
-                    target_viewport->camera.updateRotateAroundCenter(pos, current_time);
-                }
+                const float current_time = static_cast<float>(SDL_GetTicks() / 1000.0f);
+                target_viewport->camera.orbitDrag(
+                    pos, camera_navigation_mode_ == CameraNavigationMode::Trackball, current_time);
+                orbit_coast_viewport_ = target_viewport;
                 break;
             }
             default:
@@ -1363,10 +1457,13 @@ namespace lfs::vis {
         }
         auto& target_viewport = *interaction->viewport;
         focusSplitPanel(interaction->panel);
+        target_viewport.camera.finishGlide();
 
         const float delta = static_cast<float>(yoff);
         if (std::abs(delta) < 0.01f)
             return;
+
+        const bool carry_pivot = camera_navigation_mode_ == CameraNavigationMode::FPV;
 
         if (scroll_action == input::Action::CAMERA_ROLL) {
             target_viewport.camera.rotate_roll(delta);
@@ -1387,12 +1484,11 @@ namespace lfs::vis {
                         settings.ortho_scale = std::clamp(settings.ortho_scale * scale_factor, MIN_ORTHO_SCALE, MAX_ORTHO_SCALE);
                         services().renderingOrNull()->updateSettings(settings);
                     }
-                    services().renderingOrNull()->markDirty(DirtyFlag::CAMERA);
                 } else {
-                    target_viewport.camera.zoom(delta);
+                    target_viewport.camera.zoom(delta, carry_pivot);
                 }
             } else {
-                target_viewport.camera.zoom(delta);
+                target_viewport.camera.zoom(delta, carry_pivot);
             }
         } else {
             return;
@@ -1447,7 +1543,10 @@ namespace lfs::vis {
         double mx = mx_f, my = my_f;
         const bool over_gui_hover = isPointerOverUiHover(mx, my);
         const auto tool_mode = getCurrentToolMode();
-        const auto bound_action = bindings_.getActionForKey(tool_mode, logical_key, mods);
+        auto bound_action = bindings_.getActionForKey(tool_mode, logical_key, mods);
+        if (bound_action == input::Action::NONE) {
+            bound_action = resolveCrossToolActivationShortcut(bindings_, tool_mode, logical_key, mods);
+        }
         if (action == input::ACTION_PRESS &&
             dispatchSelectionActionToModal(bound_action, mods, mx, my)) {
             return;
@@ -1513,10 +1612,7 @@ namespace lfs::vis {
         }
 
         if (action == input::ACTION_PRESS) {
-            if (handleSelectionModeShortcut(bound_action, gui))
-                return;
-
-            if (handleToolbarToolShortcut(bound_action))
+            if (handleToolControlActivationShortcut(bound_action, gui))
                 return;
         }
 
@@ -1533,6 +1629,14 @@ namespace lfs::vis {
 
             case input::Action::TOGGLE_GT_COMPARISON:
                 cmd::ToggleGTComparison{}.emit();
+                return;
+
+            case input::Action::TOGGLE_CAMERA_FRUSTUMS:
+                if (auto* rendering_manager = services().renderingOrNull()) {
+                    auto settings = rendering_manager->getSettings();
+                    settings.show_camera_frustums = !settings.show_camera_frustums;
+                    rendering_manager->updateSettings(settings);
+                }
                 return;
 
             case input::Action::CAMERA_NEXT_VIEW:
@@ -1621,6 +1725,8 @@ namespace lfs::vis {
                                 selection_service->setInteractiveSelectionMode(SelectionMode::Add);
                             } else if (mods & input::KEYMOD_CTRL) {
                                 selection_service->setInteractiveSelectionMode(SelectionMode::Remove);
+                            } else if (mods & input::KEYMOD_ALT) {
+                                selection_service->setInteractiveSelectionMode(SelectionMode::Intersect);
                             } else {
                                 selection_service->setInteractiveSelectionMode(SelectionMode::Replace);
                             }
@@ -1688,6 +1794,10 @@ namespace lfs::vis {
 
             case input::Action::COPY_SELECTION:
                 cmd::CopySelection{}.emit();
+                return;
+
+            case input::Action::CUT_SELECTION:
+                cmd::CutSelection{}.emit();
                 return;
 
             case input::Action::PASTE_SELECTION:
@@ -1784,6 +1894,8 @@ namespace lfs::vis {
     }
 
     void InputController::update(float delta_time) {
+        maybeInitializeDepthViewRange();
+
         if (input_router_) {
             const bool any_mouse_buttons_pressed = SDL_GetMouseState(nullptr, nullptr) != 0;
             input_router_->syncPressedMouseButtons(any_mouse_buttons_pressed);
@@ -1889,36 +2001,114 @@ namespace lfs::vis {
             keys_movement_[5] = false;
         }
 
-        // Handle continuous movement
-        if (shouldCameraHandleInput() && drag_mode_ != DragMode::Gizmo && drag_mode_ != DragMode::Splitter) {
-            auto& movement_viewport = activeKeyboardViewport();
-            const float movement_speed_bonus =
-                (getModifierKeys() & input::KEYMOD_SHIFT) != 0 ? kWasdShiftSpeedBonus : 0.0f;
-            if (keys_movement_[0]) {
-                movement_viewport.camera.advance_forward(delta_time, movement_speed_bonus);
-            }
-            if (keys_movement_[1]) {
-                movement_viewport.camera.advance_left(delta_time, movement_speed_bonus);
-            }
-            if (keys_movement_[2]) {
-                movement_viewport.camera.advance_backward(delta_time, movement_speed_bonus);
-            }
-            if (keys_movement_[3]) {
-                movement_viewport.camera.advance_right(delta_time, movement_speed_bonus);
-            }
-            if (keys_movement_[4]) {
-                movement_viewport.camera.advance_up(delta_time, movement_speed_bonus);
-            }
-            if (keys_movement_[5]) {
-                movement_viewport.camera.advance_down(delta_time, movement_speed_bonus);
+        // Orbit ease-out: while dragging, let a held-still pause fade the stored
+        // motion; once released, coast the remembered rotation to a smooth stop.
+        if (orbit_coast_viewport_) {
+            auto& orbit_camera = orbit_coast_viewport_->camera;
+            if (drag_mode_ == DragMode::Orbit) {
+                orbit_camera.decayOrbitMomentum(delta_time);
+            } else if (orbit_camera.hasOrbitMomentum()) {
+                orbit_camera.updateOrbitCoast(delta_time);
+                onCameraMovementStart();
+                publishCameraMove(orbit_coast_viewport_);
+                if (!orbit_camera.hasOrbitMomentum()) {
+                    ui::CameraMove{
+                        .rotation = orbit_coast_viewport_->getRotationMatrix(),
+                        .translation = orbit_coast_viewport_->getTranslation()}
+                        .emit();
+                    orbit_coast_viewport_ = nullptr;
+                }
+            } else {
+                orbit_coast_viewport_ = nullptr;
             }
         }
 
-        // Publish if moving (removed inertia check)
-        bool moving = keys_movement_[0] || keys_movement_[1] || keys_movement_[2] || keys_movement_[3] || keys_movement_[4] || keys_movement_[5];
-        if (moving) {
+        // Pan ease-out: mirror the orbit coast for click-drag panning. While the
+        // button is held a paused drag fades the stored motion; once released the
+        // remembered translation coasts to a smooth stop.
+        if (pan_coast_viewport_) {
+            auto& pan_camera = pan_coast_viewport_->camera;
+            if (drag_mode_ == DragMode::Pan) {
+                pan_camera.decayPanMomentum(delta_time);
+            } else if (pan_camera.hasPanMomentum()) {
+                pan_camera.updatePanCoast(delta_time);
+                onCameraMovementStart();
+                publishCameraMove(pan_coast_viewport_);
+                if (!pan_camera.hasPanMomentum()) {
+                    ui::CameraMove{
+                        .rotation = pan_coast_viewport_->getRotationMatrix(),
+                        .translation = pan_coast_viewport_->getTranslation()}
+                        .emit();
+                    pan_coast_viewport_ = nullptr;
+                }
+            } else {
+                pan_coast_viewport_ = nullptr;
+            }
+        }
+
+        // Drive the set-pivot recenter glide
+        if (auto& glide_viewport = activeKeyboardViewport(); glide_viewport.camera.isGliding()) {
+            const bool movement_keys_active = keys_movement_[0] || keys_movement_[1] || keys_movement_[2] ||
+                                              keys_movement_[3] || keys_movement_[4] || keys_movement_[5];
+            if (movement_keys_active) {
+                glide_viewport.camera.finishGlide();
+            } else {
+                glide_viewport.camera.updateGlide(delta_time);
+            }
             onCameraMovementStart();
-            publishCameraMove(&activeKeyboardViewport());
+            publishCameraMove(&glide_viewport);
+            if (!glide_viewport.camera.isGliding()) {
+                ui::CameraMove{
+                    .rotation = glide_viewport.getRotationMatrix(),
+                    .translation = glide_viewport.getTranslation()}
+                    .emit();
+            }
+        }
+
+        // Handle continuous WASD movement. The camera carries a damped velocity,
+        // so motion eases in on press and glides to rest on release. Drive it
+        // every frame while momentum remains so a released key decays to zero.
+        auto* const active_movement_viewport = &activeKeyboardViewport();
+        const bool camera_can_move = shouldCameraHandleInput() &&
+                                     drag_mode_ != DragMode::Gizmo && drag_mode_ != DragMode::Splitter;
+        const bool keys_active = camera_can_move &&
+                                 (keys_movement_[0] || keys_movement_[1] || keys_movement_[2] ||
+                                  keys_movement_[3] || keys_movement_[4] || keys_movement_[5]);
+
+        if (keys_active) {
+            if (wasd_momentum_viewport_ && wasd_momentum_viewport_ != active_movement_viewport) {
+                wasd_momentum_viewport_->camera.clearWasdMomentum();
+            }
+            wasd_momentum_viewport_ = active_movement_viewport;
+        }
+
+        auto* const movement_viewport = keys_active ? active_movement_viewport : wasd_momentum_viewport_;
+        if (movement_viewport && (keys_active || movement_viewport->camera.hasWasdMomentum())) {
+            const float movement_speed_bonus =
+                (keys_active && (getModifierKeys() & input::KEYMOD_SHIFT) != 0) ? kWasdShiftSpeedBonus : 0.0f;
+            movement_viewport->camera.setSceneExtent(sceneExtent());
+            movement_viewport->camera.advanceWasd(
+                delta_time,
+                keys_active && keys_movement_[0],
+                keys_active && keys_movement_[2],
+                keys_active && keys_movement_[1],
+                keys_active && keys_movement_[3],
+                keys_active && keys_movement_[4],
+                keys_active && keys_movement_[5],
+                movement_speed_bonus);
+
+            onCameraMovementStart();
+            publishCameraMove(movement_viewport);
+
+            if (!keys_active && !movement_viewport->camera.hasWasdMomentum()) {
+                ui::CameraMove{
+                    .rotation = movement_viewport->getRotationMatrix(),
+                    .translation = movement_viewport->getTranslation()}
+                    .emit();
+                wasd_momentum_viewport_ = nullptr;
+            }
+        } else if (!keys_active) {
+            wasd_momentum_viewport_ = nullptr;
         }
 
         // Check if camera movement has timed out and should resume training
@@ -1960,7 +2150,7 @@ namespace lfs::vis {
                 } else {
                     LOG_DEBUG("Ignoring additional dropped environment map: {}", lfs::core::path_to_utf8(filepath));
                 }
-            } else if (ext == ".ply" || ext == ".sog" || ext == ".spz" ||
+            } else if (ext == ".ply" || ext == ".sog" || ext == ".spz" || ext == ".rad" ||
                        ext == ".usd" || ext == ".usda" || ext == ".usdc" || ext == ".usdz") {
                 splat_files.push_back(filepath);
             } else if (ext == ".obj" || ext == ".fbx" || ext == ".gltf" || ext == ".glb" ||
@@ -2028,7 +2218,7 @@ namespace lfs::vis {
 
         if (!unrecognized_files.empty() && splat_files.empty() && !dataset_path && !environment_map_path) {
             static constexpr auto SUPPORTED_FORMATS =
-                "Supported formats: .ply, .sog, .spz, .usd, .usda, .usdc, .usdz, .obj, .fbx, .gltf, .glb, .stl, .dae, .hdr, .exr, .json, .resume, or dataset directories";
+                "Supported formats: .ply, .sog, .spz, .rad, .usd, .usda, .usdc, .usdz, .obj, .fbx, .gltf, .glb, .stl, .dae, .hdr, .exr, .json, .resume, or dataset directories";
             LOG_DEBUG("Dropped {} unrecognized file(s)", unrecognized_files.size());
             state::FileDropFailed{.files = unrecognized_files, .error = SUPPORTED_FORMATS}.emit();
         }
@@ -2085,8 +2275,7 @@ namespace lfs::vis {
         if (!std::isfinite(pivot_distance) || pivot_distance < 0.1f)
             pivot_distance = 5.0f;
 
-        target_viewport.camera.R = pose.rotation;
-        target_viewport.camera.t = pose.translation;
+        target_viewport.setViewMatrix(pose.rotation, pose.translation);
 
         target_viewport.camera.updatePivotFromCamera(pivot_distance);
 
@@ -2220,48 +2409,96 @@ namespace lfs::vis {
 
         glm::vec3 total_min(std::numeric_limits<float>::max());
         glm::vec3 total_max(std::numeric_limits<float>::lowest());
-
-        // Accumulate world-space AABB from node's local bounds
-        const auto accumulateBounds = [&](const core::SceneNode* node) {
-            glm::vec3 local_min, local_max;
-            if (!scene.getNodeBounds(node->id, local_min, local_max))
-                return;
-
-            const glm::mat4 world_xform = scene_coords::nodeVisualizerWorldTransform(scene, node->id);
-            for (int i = 0; i < 8; ++i) {
-                const glm::vec3 corner(
-                    (i & 1) ? local_max.x : local_min.x,
-                    (i & 2) ? local_max.y : local_min.y,
-                    (i & 4) ? local_max.z : local_min.z);
-                const glm::vec3 world_pt = glm::vec3(world_xform * glm::vec4(corner, 1.0f));
-                total_min = glm::min(total_min, world_pt);
-                total_max = glm::max(total_max, world_pt);
-            }
-        };
+        bool has_bounds = false;
 
         if (selected.empty()) {
-            // Focus on entire scene (skip group nodes)
-            for (const auto* node : scene.getNodes()) {
-                if (node->type == core::NodeType::GROUP || node->type == core::NodeType::PLY_SEQUENCE ||
-                    node->type == core::NodeType::CAMERA_GROUP ||
-                    node->type == core::NodeType::IMAGE_GROUP)
-                    continue;
-                accumulateBounds(node);
-            }
+            has_bounds = computeWholeSceneBounds(total_min, total_max);
         } else {
-            // Focus on selected nodes
             for (const auto& name : selected) {
                 if (const auto* node = scene.getNode(name))
-                    accumulateBounds(node);
+                    expandNodeWorldBounds(scene, *node, total_min, total_max);
             }
+            has_bounds = total_min.x <= total_max.x;
         }
 
-        if (total_min.x <= total_max.x) {
+        if (has_bounds) {
             target_viewport.camera.focusOnBounds(total_min, total_max);
             publishCameraMove(&target_viewport);
             return true;
         }
         return false;
+    }
+
+    // Whole-scene world AABB, skipping container nodes that carry no geometry.
+    // use_percentile yields the trimmed (outlier-excluding) box.
+    bool InputController::computeWholeSceneBounds(glm::vec3& out_min, glm::vec3& out_max,
+                                                  const bool use_percentile) const {
+        if (!tool_context_)
+            return false;
+        auto* const sm = tool_context_->getSceneManager();
+        if (!sm)
+            return false;
+
+        const auto& scene = sm->getScene();
+        out_min = glm::vec3(std::numeric_limits<float>::max());
+        out_max = glm::vec3(std::numeric_limits<float>::lowest());
+
+        for (const auto* node : scene.getNodes()) {
+            if (node->type == core::NodeType::GROUP || node->type == core::NodeType::PLY_SEQUENCE ||
+                node->type == core::NodeType::DATASET ||
+                node->type == core::NodeType::CAMERA_GROUP ||
+                node->type == core::NodeType::IMAGE_GROUP)
+                continue;
+            expandNodeWorldBounds(scene, *node, out_min, out_max, use_percentile);
+        }
+
+        return out_min.x <= out_max.x;
+    }
+
+    // Cached whole-scene radius used to scale WASD speed and cap pan distance by
+    // splat size. Uses the trimmed (1st/99th percentile) bounds so a few far-flung
+    // floaters can't blow up the extent and make navigation far too fast. Lazily
+    // computed after load (bounds may not exist the instant SceneLoaded fires) and
+    // invalidated on scene load/clear. Returns 0 while no geometry is present.
+    float InputController::sceneExtent() {
+        if (scene_extent_ > 0.0f)
+            return scene_extent_;
+
+        glm::vec3 min, max;
+        if (computeWholeSceneBounds(min, max, /*use_percentile=*/true))
+            scene_extent_ = glm::length(max - min) * 0.5f;
+
+        return scene_extent_;
+    }
+
+    // Seed the depth-map range from the trimmed scene scale once the extent is
+    // known after a load, so the palette spans the actual content instead of the
+    // fixed 0.1..100 default that is useless on large RAD scenes. Runs once per
+    // scene; the user owns the range after that.
+    void InputController::maybeInitializeDepthViewRange() {
+        if (depth_range_initialized_)
+            return;
+
+        const float radius = sceneExtent();
+        if (radius <= 0.0f)
+            return;
+
+        auto* const rendering = services().renderingOrNull();
+        if (!rendering)
+            return;
+
+        constexpr float kDepthViewInitNear = 1.0f;
+        auto settings = rendering->getSettings();
+        settings.depth_view_min = kDepthViewInitNear;
+        settings.depth_view_max = radius;
+        sanitizeDepthViewSettings(settings);
+        rendering->updateSettings(settings);
+
+        depth_range_initialized_ = true;
+    }
+
+    bool InputController::focusSelection() {
+        return handleFocusSelection(activeKeyboardViewport());
     }
 
     // Helpers
@@ -2384,7 +2621,10 @@ namespace lfs::vis {
     void InputController::beginPanDrag(const PanelInteractionState& interaction, const int button,
                                        const double x, const double y) {
         LOG_PERF("InputController::beginPanDrag button={} pos=({},{})", button, x, y);
-        interaction.viewport->camera.initScreenPos(glm::vec2(x, y));
+        const float current_time = static_cast<float>(SDL_GetTicks() / 1000.0f);
+        interaction.viewport->camera.finishGlide();
+        interaction.viewport->camera.setSceneExtent(sceneExtent());
+        interaction.viewport->camera.startPan(glm::vec2(x, y), current_time);
         drag_viewport_ = interaction.viewport;
         drag_split_panel_ = interaction.panel;
         focusSplitPanel(interaction.panel);
@@ -2423,6 +2663,14 @@ namespace lfs::vis {
         if (was_camera_drag) {
             onCameraMovementEnd();
         }
+    }
+
+    void InputController::clearWasdMomentumViewport() {
+        if (!wasd_momentum_viewport_) {
+            return;
+        }
+        wasd_momentum_viewport_->camera.clearWasdMomentum();
+        wasd_momentum_viewport_ = nullptr;
     }
 
     bool InputController::canOpenSelectedCameraContextMenu(const int hovered_camera_uid) const {
@@ -2608,6 +2856,11 @@ namespace lfs::vis {
             return false;
         }
 
+        target_viewport.camera.clearOrbitMomentum();
+        if (&target_viewport == orbit_coast_viewport_) {
+            orbit_coast_viewport_ = nullptr;
+        }
+
         if (auto* const rendering = services().renderingOrNull()) {
             rendering->setGridPlaneForPanel(panel, snapped_axis);
         }
@@ -2654,8 +2907,8 @@ namespace lfs::vis {
             selection_tool_->syncDepthFilterToCamera(*active_viewport);
         }
 
-        if (services().renderingOrNull()) {
-            services().renderingOrNull()->markDirty(DirtyFlag::CAMERA);
+        if (auto* const rendering = services().renderingOrNull()) {
+            rendering->markCameraPoseChanged();
         }
 
         // Throttle event emission
@@ -2713,7 +2966,7 @@ namespace lfs::vis {
     }
 
     glm::vec3 InputController::unprojectScreenPoint(double x, double y, float fallback_distance) const {
-        const auto* const rendering = services().renderingOrNull();
+        auto* const rendering = services().renderingOrNull();
         const auto interaction = rendering
                                      ? rendering->resolveViewerPanel(
                                            viewport_,
@@ -2729,24 +2982,44 @@ namespace lfs::vis {
 
         const float local_x = static_cast<float>(x) - interaction->x;
         const float local_y = static_cast<float>(y) - interaction->y;
-        const float focal_length_mm = rendering->getFocalLengthMm();
+        const auto render_settings = rendering->getSettings();
+        const float focal_length_mm = render_settings.focal_length_mm;
+        const float ortho_scale = target_viewport->ortho_scale_override.value_or(render_settings.ortho_scale);
         Viewport projection_viewport = *target_viewport;
         projection_viewport.windowSize = glm::ivec2(
             std::max(static_cast<int>(interaction->width), 1),
             std::max(static_cast<int>(interaction->height), 1));
 
-        const float depth = rendering->getDepthAtPixel(
-            static_cast<int>(local_x), static_cast<int>(local_y), interaction->panel);
+        const int sample_x = static_cast<int>(local_x);
+        const int sample_y = static_cast<int>(local_y);
+        float depth = -1.0f;
+        if (auto* const scene_manager = services().sceneOrNull()) {
+            depth = rendering->renderExpectedDepthAtPixel(
+                RenderingManager::ExpectedDepthSampleRequest{
+                    .scene_manager = scene_manager,
+                    .viewport = &projection_viewport,
+                    .render_size = projection_viewport.windowSize,
+                    .pixel = {sample_x, sample_y},
+                    .focal_length_mm = focal_length_mm,
+                    .orthographic = render_settings.orthographic,
+                    .ortho_scale = ortho_scale,
+                });
+        }
+        if (depth <= 0.0f) {
+            depth = rendering->getDepthAtPixel(sample_x, sample_y, interaction->panel);
+        }
 
         if (depth > 0.0f) {
-            const glm::vec3 world = projection_viewport.unprojectPixel(local_x, local_y, depth, focal_length_mm);
+            const glm::vec3 world = projection_viewport.unprojectPixel(
+                local_x, local_y, depth, focal_length_mm, render_settings.orthographic, ortho_scale);
             if (Viewport::isValidWorldPosition(world)) {
                 return world;
             }
         }
 
         const glm::vec3 fallback_world =
-            projection_viewport.unprojectPixel(local_x, local_y, fallback_distance, focal_length_mm);
+            projection_viewport.unprojectPixel(
+                local_x, local_y, fallback_distance, focal_length_mm, render_settings.orthographic, ortho_scale);
         if (Viewport::isValidWorldPosition(fallback_world)) {
             return fallback_world;
         }

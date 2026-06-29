@@ -41,6 +41,9 @@ add_library(lfs_visualizer ${LFS_VIS_LIB_TYPE}
         rendering/rendering_manager_frame.cpp
         rendering/rendering_manager_vulkan.cpp
         rendering/rendering_manager_viewport.cpp
+        rendering/lod_page_cache.cpp
+        rendering/lod_upload_engine.cpp
+        rendering/spark_lod_controller.cpp
         rendering/split_view_composition.cpp
         rendering/split_view_service.cpp
         rendering/viewport_artifact_service.cpp
@@ -249,11 +252,16 @@ endif()
 target_sources(lfs_visualizer
         PRIVATE
         gui/rmlui/rmlui_vk_backend.cpp
+        rendering/lod_page_dequant_cuda.cu
         rendering/vksplat_input_packer.cpp
         rendering/vksplat_input_packer_cuda.cu
         rendering/vksplat_viewport_renderer.cpp
         rendering/vulkan_external_tensor.cpp
         rendering/point_cloud_vulkan_renderer.cpp)
+# The CPU chunk decoders round multiplies and adds separately; FMA contraction
+# in the dequant kernel would break CPU/GPU bit-parity (guarded by gtest).
+set_source_files_properties(rendering/lod_page_dequant_cuda.cu PROPERTIES
+        COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>")
 if((NOT DEFINED glslang_DIR OR "${glslang_DIR}" STREQUAL "") AND DEFINED VCPKG_TARGET_TRIPLET)
     set(_LFS_VCPKG_GLSLANG_DIR "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/share/glslang")
     if(EXISTS "${_LFS_VCPKG_GLSLANG_DIR}/glslangConfig.cmake"
@@ -290,6 +298,7 @@ compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/textured_overla
 compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/textured_overlay.frag" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/textured_overlay.frag.spv.h" kTexturedOverlayFragSpv)
 compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/pivot.vert" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/pivot.vert.spv.h" kPivotVertSpv)
 compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/pivot.frag" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/pivot.frag.spv.h" kPivotFragSpv)
+compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/frustum.vert" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/frustum.vert.spv.h" kFrustumVertSpv)
 compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/mesh.vert" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/mesh.vert.spv.h" kMeshVertSpv)
 compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/mesh.frag" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/mesh.frag.spv.h" kMeshFragSpv)
 compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/mesh_shadow.vert" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/mesh_shadow.vert.spv.h" kMeshShadowVertSpv)

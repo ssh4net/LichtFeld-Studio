@@ -307,6 +307,7 @@ namespace lfs::training {
         // Pre-allocate output tensors (reused across iterations)
         thread_local core::Tensor image;
         thread_local core::Tensor alpha;
+        thread_local core::Tensor depth;
         thread_local int last_width = -1;
         thread_local int last_height = -1;
 
@@ -314,12 +315,16 @@ namespace lfs::training {
         if (last_width != width || last_height != height) {
             image = core::Tensor::empty({3, static_cast<size_t>(height), static_cast<size_t>(width)});
             alpha = core::Tensor::empty({1, static_cast<size_t>(height), static_cast<size_t>(width)});
+            depth = core::Tensor::empty({1, static_cast<size_t>(height), static_cast<size_t>(width)});
             last_width = width;
             last_height = height;
         }
 
         // Call forward_raw with raw pointers (no PyTorch wrappers)
         // Use adjusted cx/cy for tile rendering
+        const cudaStream_t raster_stream = lfs::core::getCurrentCUDAStream()
+                                               ? lfs::core::getCurrentCUDAStream()
+                                               : image.stream();
         fast_lfs::rasterization::ForwardContext forward_ctx;
         try {
             forward_ctx = fast_lfs::rasterization::forward_raw(
@@ -333,6 +338,7 @@ namespace lfs::training {
                 cam_position_ptr,
                 image.ptr<float>(),
                 alpha.ptr<float>(),
+                depth.ptr<float>(),
                 n_primitives,
                 active_sh_bases,
                 sh_layout_bases,
@@ -344,7 +350,8 @@ namespace lfs::training {
                 cy_adjusted, // Use adjusted cy for tile offset
                 near_plane,
                 far_plane,
-                mip_filter);
+                mip_filter,
+                raster_stream);
         } catch (const std::exception& e) {
             // Dump all input data for debugging
             dump_crash_data(
@@ -411,12 +418,14 @@ namespace lfs::training {
 
         render_output.image = image;
         render_output.alpha = alpha;
+        render_output.depth = depth;
         render_output.width = width;
         render_output.height = height;
 
         // Prepare context for backward
         ctx.image = image;
         ctx.alpha = alpha;
+        ctx.depth = depth;
         ctx.bg_color = bg_color; // Save bg_color for alpha gradient
         ctx.bg_image = bg_image; // Save bg_image for alpha gradient
 
@@ -460,7 +469,9 @@ namespace lfs::training {
         const core::Tensor& pixel_error_map,
         DensificationType densification_type,
         int iteration,
-        const FastGSFusedExtraGradients& fused_extra_gradients) {
+        const FastGSFusedExtraGradients& fused_extra_gradients,
+        const core::Tensor& grad_depth,
+        bool detach_depth_weights) {
 
         // Compute grad_alpha from background blending: output = image + (1 - alpha) * bg
         int H, W;
@@ -512,6 +523,26 @@ namespace lfs::training {
                              ? grad_alpha_extra.squeeze(0)
                              : grad_alpha_extra;
             grad_alpha.add_(extra);
+        }
+
+        core::Tensor grad_depth_2d;
+        const float* grad_depth_ptr = nullptr;
+        if (grad_depth.is_valid() && grad_depth.numel() > 0) {
+            grad_depth_2d = grad_depth;
+            if (grad_depth_2d.ndim() == 3 && grad_depth_2d.shape()[0] == 1) {
+                grad_depth_2d = grad_depth_2d.squeeze(0);
+            }
+            assert(grad_depth_2d.ndim() == 2 &&
+                   checked_dim_to_int(grad_depth_2d.shape()[0], "grad_depth height") == H &&
+                   checked_dim_to_int(grad_depth_2d.shape()[1], "grad_depth width") == W &&
+                   "grad_depth must have shape [H, W] or [1, H, W]");
+            if (grad_depth_2d.device() != core::Device::CUDA) {
+                grad_depth_2d = grad_depth_2d.cuda();
+            }
+            if (!grad_depth_2d.is_contiguous()) {
+                grad_depth_2d = grad_depth_2d.contiguous();
+            }
+            grad_depth_ptr = grad_depth_2d.ptr<float>();
         }
 
         const int n_primitives = checked_dim_to_int(ctx.means.shape()[0], "n_primitives");
@@ -588,6 +619,7 @@ namespace lfs::training {
             use_pixel_error_densification ? error_map_2d.ptr<float>() : nullptr,
             grad_image.ptr<float>(),
             grad_alpha.ptr<float>(),
+            grad_depth_ptr,
             raw_image.ptr<float>(),
             ctx.alpha.ptr<float>(),
             ctx.means.ptr<float>(),
@@ -610,7 +642,8 @@ namespace lfs::training {
             ctx.center_y,
             ctx.mip_filter,
             densification_type,
-            &fused_adam);
+            &fused_adam,
+            detach_depth_weights);
 
         ctx.mark_forward_context_released();
 

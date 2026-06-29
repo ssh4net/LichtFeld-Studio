@@ -17,10 +17,12 @@
 #include "window/window_manager.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <cuda_runtime.h>
 #include <format>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 
 namespace lfs::vis {
@@ -28,6 +30,20 @@ namespace lfs::vis {
     using namespace lfs::core::events;
 
     namespace {
+        [[nodiscard]] std::vector<size_t> normalize_save_steps(std::vector<size_t> steps) {
+            steps.erase(std::remove(steps.begin(), steps.end(), 0), steps.end());
+            std::sort(steps.begin(), steps.end());
+            steps.erase(std::unique(steps.begin(), steps.end()), steps.end());
+            return steps;
+        }
+
+        void apply_save_steps(lfs::core::param::OptimizationParameters& params,
+                              const std::vector<size_t>& steps) {
+            params.save_steps = steps;
+            if (params.enable_eval)
+                params.eval_steps = steps;
+        }
+
         [[nodiscard]] lfs::core::SplatTensorAllocator makeVulkanTrainingTensorAllocator(VisualizerImpl* viewer) {
             if (!viewer || !viewer->getWindowManager()) {
                 return {};
@@ -243,29 +259,29 @@ namespace lfs::vis {
     void TrainerManager::clearTrainer() {
         LOG_DEBUG("Clearing trainer");
 
-        // Stop any ongoing training first
         const auto state = getState();
         if (state == TrainingState::Running || state == TrainingState::Paused) {
             LOG_INFO("Stopping active training before clearing");
-            // If paused, resume first so thread can process stop request
             if (state == TrainingState::Paused && trainer_) {
                 trainer_->request_resume();
             }
             stopTraining();
-            waitForCompletion();
-        } else if (state == TrainingState::Stopping) {
-            // Already stopping, just wait for completion
-            LOG_INFO("Waiting for training to finish stopping");
+        }
+
+        if (training_thread_ && training_thread_->joinable()) {
+            if (training_thread_->get_id() == std::this_thread::get_id()) {
+                LOG_ERROR("Cannot clear trainer from its own training thread");
+                return;
+            }
+            LOG_INFO("Waiting for training thread before clearing trainer");
             waitForCompletion();
         }
 
-        // Destroy trainer - destructor handles cleanup
         {
             std::lock_guard<std::mutex> lock(trainer_lifetime_mutex_);
             trainer_.reset();
         }
 
-        // Transition to Idle
         updateResourceTracking();
 
         if (getState() != TrainingState::Idle && !state_machine_.transitionTo(TrainingState::Idle)) {
@@ -480,22 +496,146 @@ namespace lfs::vis {
     }
 
     void TrainerManager::pauseTrainingTemporary() {
-        if (!isRunning())
+        if (!isRunning() || !trainer_) {
             return;
-
-        if (trainer_) {
-            trainer_->request_pause();
-            LOG_TRACE("Training temporarily paused at iteration {}", getCurrentIteration());
         }
+
+        const int iteration = getCurrentIteration();
+        const bool was_paused = trainer_->is_paused();
+        {
+            std::lock_guard lock(temporary_pause_mutex_);
+            if (temporary_pause_depth_ == 0) {
+                temporary_pause_initially_paused_ = was_paused && !temporary_pause_resume_in_flight_;
+                temporary_pause_resume_in_flight_ = false;
+            }
+            ++temporary_pause_depth_;
+        }
+
+        trainer_->request_pause();
+        LOG_TRACE("Training temporary pause requested at iteration {}", iteration);
+    }
+
+    TrainerManager::TemporaryPauseResult
+    TrainerManager::pauseTrainingTemporaryAndWait(const std::chrono::milliseconds timeout) {
+        if (!isRunning() || !trainer_) {
+            return {};
+        }
+
+        const int start_iteration = getCurrentIteration();
+        const bool was_paused = trainer_->is_paused();
+        {
+            std::lock_guard lock(temporary_pause_mutex_);
+            if (temporary_pause_depth_ == 0) {
+                temporary_pause_initially_paused_ = was_paused && !temporary_pause_resume_in_flight_;
+                temporary_pause_resume_in_flight_ = false;
+            }
+            ++temporary_pause_depth_;
+        }
+
+        const auto release_failed_lease = [&]() -> bool {
+            bool resume_training = false;
+            bool initially_paused = false;
+            const bool can_resume = isRunning() && trainer_ != nullptr;
+            {
+                std::lock_guard lock(temporary_pause_mutex_);
+                if (temporary_pause_depth_ == 0) {
+                    LOG_WARN("Temporary training pause lease release underflow");
+                    return false;
+                }
+                initially_paused = temporary_pause_initially_paused_;
+                --temporary_pause_depth_;
+                resume_training = temporary_pause_depth_ == 0 && !initially_paused;
+                if (temporary_pause_depth_ == 0) {
+                    temporary_pause_initially_paused_ = false;
+                    temporary_pause_resume_in_flight_ = resume_training && can_resume;
+                }
+            }
+            return resume_training;
+        };
+
+        trainer_->request_pause();
+
+        const auto pause_start = std::chrono::steady_clock::now();
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (isRunning() && !trainer_->is_paused()) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                LOG_WARN("Timed out waiting for temporary training pause: start_iteration={}, current_iteration={}, waited_ms={}, was_paused={}",
+                         start_iteration,
+                         getCurrentIteration(),
+                         timeout.count(),
+                         was_paused);
+                const bool resume_training = release_failed_lease();
+                if (resume_training && isRunning() && trainer_) {
+                    trainer_->request_resume();
+                }
+                return {};
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+
+        if (!isRunning()) {
+            (void)release_failed_lease();
+            return {};
+        }
+
+        const auto paused_at = std::chrono::steady_clock::now();
+        const double pause_wait_ms = std::chrono::duration<double, std::milli>(paused_at - pause_start).count();
+        const auto sync_start = std::chrono::steady_clock::now();
+        const cudaError_t sync_status = cudaDeviceSynchronize();
+        const auto sync_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - sync_start)
+                .count();
+        if (sync_status != cudaSuccess) {
+            LOG_WARN("CUDA sync after temporary training pause failed: error={}, sync_ms={:.1f}, start_iteration={}, current_iteration={}",
+                     cudaGetErrorString(sync_status),
+                     sync_ms,
+                     start_iteration,
+                     getCurrentIteration());
+            const bool resume_training = release_failed_lease();
+            if (resume_training && isRunning() && trainer_) {
+                trainer_->request_resume();
+            }
+            return {};
+        }
+
+        LOG_DEBUG("Training temporarily paused and synchronized: start_iteration={}, current_iteration={}, pause_wait_ms={:.1f}, sync_ms={:.1f}",
+                  start_iteration,
+                  getCurrentIteration(),
+                  pause_wait_ms,
+                  sync_ms);
+        return {
+            .synchronized = true,
+            .resume_required = true,
+        };
     }
 
     void TrainerManager::resumeTrainingTemporary() {
-        if (!isRunning())
-            return;
+        const bool running = isRunning();
+        const int iteration = getCurrentIteration();
+        const bool trainer_present = trainer_ != nullptr;
+        bool resume_training = false;
+        bool root_initially_paused = false;
+        {
+            std::lock_guard lock(temporary_pause_mutex_);
+            if (temporary_pause_depth_ == 0) {
+                LOG_WARN("Temporary training resume ignored without active lease: iteration={}, running={}, trainer_present={}",
+                         iteration,
+                         running,
+                         trainer_present);
+                return;
+            }
+            root_initially_paused = temporary_pause_initially_paused_;
+            --temporary_pause_depth_;
+            resume_training = temporary_pause_depth_ == 0 && !root_initially_paused;
+            if (temporary_pause_depth_ == 0) {
+                temporary_pause_initially_paused_ = false;
+                temporary_pause_resume_in_flight_ = resume_training && running && trainer_present;
+            }
+        }
 
-        if (trainer_) {
+        if (resume_training && running && trainer_) {
             trainer_->request_resume();
-            LOG_TRACE("Training resumed from temporary pause at iteration {}", getCurrentIteration());
+            LOG_TRACE("Training resumed from temporary pause at iteration {}", iteration);
         }
     }
 
@@ -591,6 +731,48 @@ namespace lfs::vis {
         if (!trainer_)
             return 0;
         return trainer_->getParams().optimization.max_cap;
+    }
+
+    std::vector<size_t> TrainerManager::getSaveSteps() const {
+        if (auto* const param_mgr = services().paramsOrNull(); param_mgr && param_mgr->isLoaded())
+            return param_mgr->copyActiveParams().save_steps;
+        if (trainer_)
+            return trainer_->getParams().optimization.save_steps;
+        return pending_opt_params_.save_steps;
+    }
+
+    bool TrainerManager::canEditSaveSteps() const {
+        return !trainer_ ||
+               !trainer_->isInitialized() ||
+               !trainer_->getParams().resume_checkpoint.has_value();
+    }
+
+    bool TrainerManager::setSaveSteps(std::vector<size_t> save_steps) {
+        if (!canEditSaveSteps())
+            return false;
+
+        save_steps = normalize_save_steps(std::move(save_steps));
+        apply_save_steps(pending_opt_params_, save_steps);
+
+        bool updated_active_params = false;
+        if (auto* const param_mgr = services().paramsOrNull()) {
+            if (const auto loaded = param_mgr->ensureLoaded(); loaded) {
+                param_mgr->modifyActiveParams([&save_steps](auto& params) {
+                    apply_save_steps(params, save_steps);
+                });
+                updated_active_params = true;
+            } else {
+                LOG_WARN("Could not update save steps: {}", loaded.error());
+            }
+        }
+
+        if (!updated_active_params && trainer_) {
+            auto params = trainer_->getParams();
+            apply_save_steps(params.optimization, save_steps);
+            trainer_->setParams(params);
+        }
+
+        return true;
     }
 
     const char* TrainerManager::getStrategyType() const {

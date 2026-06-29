@@ -18,6 +18,10 @@
     border-radius: 0;
 }
 
+.viewport-gizmo-controls .icon-btn {
+    background-color: @{toolbar.background};
+}
+
 .toolbar-separator {
     background-color: @{alpha(border,0.39)};
 }
@@ -27,13 +31,18 @@
     border-color: @{overlay.border};
 }
 
+.viewport-export-status {
+    background-color: @{toolbar.background};
+    border-color: @{overlay.border};
+    color: @{text};
+}
+
 .viewport-transform-meta__tool,
 .viewport-transform-axis-label {
     color: @{text};
 }
 
-.viewport-transform-meta__target,
-.viewport-transform-group-label {
+.viewport-transform-meta__target {
     color: @{text_dim};
 }
 
@@ -41,7 +50,9 @@
     border-color: @{alpha(border,0.30)};
 }
 
-.viewport-transform-option-group {
+.viewport-transform-option-group,
+.viewport-transform-tool-group,
+.viewport-selection-tool-group {
     background-color: @{toolbar.sub_background};
     border-color: @{alpha(border,0.39)};
 }
@@ -54,11 +65,20 @@
     background-color: @{viewport.hover_bg};
 }
 
+.toolbar-vertical .icon-btn:hover,
+.toolbar-hcenter .icon-btn:hover,
+.viewport-gizmo-controls .icon-btn:hover {
+    background-color: @{alpha(primary,0.16)};
+    border-color: @{alpha(primary,0.42)};
+}
+
 .icon-btn.selected {
     background-color: @{primary};
 }
 
-.toolbar-vertical .icon-btn.selected {
+.toolbar-vertical .icon-btn.selected,
+.toolbar-hcenter .icon-btn.selected,
+.viewport-gizmo-controls .icon-btn.selected {
     border-color: @{alpha(text,0.25)};
 }
 
@@ -66,13 +86,44 @@
     background-color: @{viewport.selected_hover};
 }
 
+.toolbar-vertical .icon-btn.selected:hover,
+.toolbar-hcenter .icon-btn.selected:hover,
+.viewport-gizmo-controls .icon-btn.selected:hover {
+    border-color: @{alpha(text,0.35)};
+}
+
 .icon-btn.selected img {
     image-color: @{background};
+}
+
+.icon-btn.disabled,
+.icon-btn.disabled:hover,
+.icon-btn.disabled:active {
+    background-color: transparent;
+    border-color: transparent;
+}
+
+.icon-btn.disabled img {
+    image-color: @{text_dim};
 }
 
 .viewport-metrics-card {
     background-color: @{viewport.metrics_bg};
     border-color: @{viewport.metrics_border};
+}
+
+.viewport-lod-stats-card {
+    background-color: @{viewport.metrics_bg};
+    border-color: @{viewport.metrics_border};
+}
+
+.viewport-lod-stats-title,
+.viewport-lod-stats-value {
+    color: @{text};
+}
+
+.viewport-lod-stats-label {
+    color: @{text_dim};
 }
 
 .viewport-metrics-label {

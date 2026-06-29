@@ -230,7 +230,9 @@ class PanelSpace(enum.Enum):
 
     BOTTOM_DOCK = 5
 
-    STATUS_BAR = 6
+    LEFT_DOCK = 6
+
+    STATUS_BAR = 7
 
 class PanelHeightMode(enum.Enum):
     FILL = 0
@@ -1895,7 +1897,7 @@ def open_folder_dialog(title: str = 'Select Folder', start_dir: str = '') -> str
 
 def open_ply_file_dialog(start_dir: str = '') -> str:
     """
-    Open a file dialog to select a splat file (.ply, .sog, .spz, .usd, .usda, .usdc, .usdz). Returns empty string if cancelled.
+    Open a file dialog to select a splat file (.ply, .sog, .spz, .rad, .usd, .usda, .usdc, .usdz). Returns empty string if cancelled.
     """
 
 def open_mesh_file_dialog(start_dir: str = '') -> str:
@@ -1946,6 +1948,16 @@ def save_laz_file_dialog(default_name: str = 'export') -> str:
 def save_json_file_dialog(default_name: str = 'config.json') -> str:
     """
     Open a save file dialog for JSON files. Returns empty string if cancelled.
+    """
+
+def save_png_file_dialog(default_name: str = 'export.png') -> str:
+    """
+    Open a save file dialog for PNG images. Returns empty string if cancelled.
+    """
+
+def save_jpg_file_dialog(default_name: str = 'export.jpg') -> str:
+    """
+    Open a save file dialog for JPEG images. Returns empty string if cancelled.
     """
 
 def save_ply_file_dialog(default_name: str = 'export') -> str:
@@ -2102,6 +2114,9 @@ def set_exit_popup_open(open: bool) -> None:
 def get_active_tool() -> str:
     """Get the currently active tool id from C++ EditorContext"""
 
+def is_tool_available(id: str) -> bool:
+    """Check whether a builtin tool is currently available"""
+
 def set_active_tool(id: str) -> None:
     """Set the active tool via C++ event"""
 
@@ -2119,6 +2134,33 @@ def clear_active_operator() -> None:
 
 def has_active_operator() -> bool:
     """Check if an operator is currently active"""
+
+def can_edit_gaussian_selection() -> bool:
+    """Return true when Gaussian selection editing is available"""
+
+def has_gaussian_selection() -> bool:
+    """Return true when any Gaussians are selected"""
+
+def has_gaussian_clipboard() -> bool:
+    """Return true when copied Gaussians are available for paste"""
+
+def copy_gaussian_selection() -> None:
+    """Copy selected Gaussians to the internal Gaussian clipboard"""
+
+def cut_gaussian_selection() -> None:
+    """Cut selected Gaussians to the internal Gaussian clipboard"""
+
+def paste_gaussian_selection() -> None:
+    """Paste copied Gaussians from the internal Gaussian clipboard"""
+
+def invert_gaussian_selection() -> None:
+    """Invert the current Gaussian selection"""
+
+def select_all_gaussians() -> None:
+    """Select all editable Gaussians"""
+
+def deselect_all_gaussians() -> None:
+    """Deselect all selected Gaussians"""
 
 def set_gizmo_type(type: str) -> None:
     """Set gizmo type without blocking camera"""
@@ -2162,6 +2204,14 @@ def set_crop_tool_shape(shape: str) -> None:
 
 def get_crop_tool_shape() -> str:
     """Get the active crop tool shape"""
+
+def set_crop_tool_operation(operation: str) -> None:
+    """
+    Set the active crop or selection-volume gizmo operation: translate, rotate, or scale
+    """
+
+def get_crop_tool_operation() -> str:
+    """Get the active crop or selection-volume gizmo operation"""
 
 def apply_crop_tool() -> None:
     """Apply the active crop tool primitive"""
@@ -2398,7 +2448,7 @@ def is_windows_platform() -> bool:
 
 def register_file_associations() -> bool:
     """
-    Register LichtFeld Studio as a supported handler for .ply, .sog, .spz, .usd, .usda, .usdc, .usdz files (Windows only)
+    Register LichtFeld Studio as a supported handler for .ply, .sog, .spz, .rad, .usd, .usda, .usdc, .usdz files (Windows only)
     """
 
 def open_file_association_settings() -> bool:
@@ -2408,12 +2458,12 @@ def open_file_association_settings() -> bool:
 
 def unregister_file_associations() -> bool:
     """
-    Remove LichtFeld Studio file associations for .ply, .sog, .spz, .usd, .usda, .usdc, .usdz (Windows only)
+    Remove LichtFeld Studio file associations for .ply, .sog, .spz, .rad, .usd, .usda, .usdc, .usdz (Windows only)
     """
 
 def are_file_associations_registered() -> bool:
     """
-    Check if LichtFeld Studio is the default handler for .ply, .sog, .spz, .usd, .usda, .usdc, .usdz (Windows only)
+    Check if LichtFeld Studio is the default handler for .ply, .sog, .spz, .rad, .usd, .usda, .usdc, .usdz (Windows only)
     """
 
 def get_pivot_mode() -> int:
@@ -2513,6 +2563,17 @@ def get_ui_scale_preference() -> float:
 def set_clipboard_text(text: str) -> None:
     """Copy text to the system clipboard"""
 
+def has_clipboard_image() -> bool:
+    """Return True if the system clipboard holds an image"""
+
+def get_clipboard_image_texture() -> tuple:
+    """
+    Read an image from the clipboard as a UI texture, returns (texture_id, width, height)
+    """
+
+def save_clipboard_image(path: str) -> bool:
+    """Decode the clipboard image and write it to path; returns success"""
+
 def set_mouse_cursor_hand() -> None:
     """Set mouse cursor to hand pointer for this frame"""
 
@@ -2539,7 +2600,7 @@ def set_cancel_operator_callback(callback: Callable) -> None:
 
 def get_selection_submode() -> int:
     """
-    Get current selection sub-mode (0=Brush, 1=Rectangle, 2=Polygon, 3=Lasso, 4=Rings)
+    Get current selection sub-mode (0=Centers, 1=Rectangle, 2=Polygon, 3=Lasso, 4=Rings, 5=Color, 6=Box, 7=Sphere)
     """
 
 def request_keyboard_capture(owner_id: str) -> None:

@@ -48,6 +48,7 @@ namespace lfs::vis::gui {
         uint64_t scene_generation = 0;
         bool has_selection = false;
         bool is_training = false;
+        bool suppress_non_native_panels = false;
     };
 
     struct FloatingPanelAnchor {
@@ -133,6 +134,7 @@ namespace lfs::vis::gui {
         uint32_t options = 0;
         PollDependency poll_dependencies = PollDependency::ALL;
         bool is_native = true;
+        bool tab_closeable = false;
         int consecutive_errors = 0;
         bool error_disabled = false;
         float initial_width = 0;
@@ -173,6 +175,7 @@ namespace lfs::vis::gui {
         bool ui_visible = true;
         bool right_panel_visible = true;
         bool bottom_dock_visible = true;
+        bool left_dock_visible = true;
     };
 
     struct PanelAnimationDemand {
@@ -182,6 +185,7 @@ namespace lfs::vis::gui {
         bool main_panel_tab = false;
         bool scene_header = false;
         bool bottom_dock = false;
+        bool left_dock = false;
         bool status_bar = false;
 
         [[nodiscard]] bool rightPanel() const {
@@ -190,7 +194,7 @@ namespace lfs::vis::gui {
 
         [[nodiscard]] bool any() const {
             return side_panel || floating || viewport_overlay || main_panel_tab ||
-                   scene_header || bottom_dock || status_bar;
+                   scene_header || bottom_dock || left_dock || status_bar;
         }
     };
 
@@ -200,6 +204,7 @@ namespace lfs::vis::gui {
         PanelSpace space;
         int order;
         bool enabled;
+        bool tab_closeable;
     };
 
     struct PanelDetails {

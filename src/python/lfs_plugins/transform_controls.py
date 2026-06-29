@@ -83,6 +83,29 @@ def _same_rotation(a: List[float], b: List[float]) -> bool:
     return abs(abs(dot) - 1.0) < QUAT_EQUIV_EPSILON
 
 
+# Local node transforms are stored in data axes; the overlay displays visualizer axes.
+def _flip_yz_rows(transform):
+    if transform is None or len(transform) != 16:
+        return transform
+    result = list(transform)
+    for col in range(4):
+        result[col * 4 + 1] = -result[col * 4 + 1]
+        result[col * 4 + 2] = -result[col * 4 + 2]
+    return result
+
+
+def _is_identity_transform(transform) -> bool:
+    if transform is None or len(transform) != 16:
+        return False
+    identity = (
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    )
+    return all(abs(float(value) - identity[i]) <= 1e-6 for i, value in enumerate(transform))
+
+
 class TransformPanelState:
     def __init__(self):
         self.editing_active = False
@@ -166,6 +189,10 @@ class TransformControlsController:
         model.bind_func("transform_show_rotate", lambda: self._active_tool == "builtin.rotate")
         model.bind_func("transform_show_scale", lambda: self._active_tool == "builtin.scale")
         model.bind_func("transform_show_actions", lambda: self._active_tool in _NUMERIC_TRANSFORM_TOOL_IDS)
+        model.bind_func("transform_can_reset", self._can_reset_transform)
+        model.bind_func("transform_can_bake", self._can_bake_transform)
+        model.bind_func("transform_reset_opacity", lambda: "1" if self._can_reset_transform() else "0.22")
+        model.bind_func("transform_bake_opacity", lambda: "1" if self._can_bake_transform() else "0.22")
         for axis in ("x", "y", "z"):
             idx = _AXIS_INDEX[axis]
             model.bind(
@@ -351,13 +378,13 @@ class TransformControlsController:
     def _single_display_transform(self, node_name: str):
         if self._single_uses_world_space():
             return lf.get_node_visualizer_world_transform(node_name)
-        return lf.get_node_transform(node_name)
+        return _flip_yz_rows(lf.get_node_transform(node_name))
 
     def _set_single_display_transform(self, node_name: str, transform):
         if self._single_uses_world_space():
             lf.set_node_visualizer_world_transform(node_name, transform)
         else:
-            lf.set_node_transform(node_name, transform)
+            lf.set_node_transform(node_name, _flip_yz_rows(transform))
 
     def _update_single_node(self):
         node_name = self._selected[0]
@@ -425,6 +452,9 @@ class TransformControlsController:
             f"{self._scale[1]:.3f}",
             f"{self._scale[2]:.3f}",
             f"{sum(self._scale) / 3.0:.3f}",
+            int(self._can_reset_transform()),
+            int(self._can_bake_transform()),
+            self._transform_action_opacity_cache(),
         )
 
     def _dirty_if_display_state_changed(self, dirty=False):
@@ -455,6 +485,10 @@ class TransformControlsController:
         self._handle.dirty("transform_show_rotate")
         self._handle.dirty("transform_show_scale")
         self._handle.dirty("transform_show_actions")
+        self._handle.dirty("transform_can_reset")
+        self._handle.dirty("transform_can_bake")
+        self._handle.dirty("transform_reset_opacity")
+        self._handle.dirty("transform_bake_opacity")
 
     def _begin_edit(self):
         if len(self._selected) == 1:
@@ -606,6 +640,53 @@ class TransformControlsController:
                 new_transform = lf.compose_transform(new_pos, decomp["rotation_euler_deg"], new_scale)
                 lf.set_node_visualizer_world_transform(name, new_transform)
 
+    def _can_reset_transform(self) -> bool:
+        if not self._selected:
+            return False
+
+        if len(self._selected) == 1:
+            transform = lf.get_node_transform(self._selected[0])
+            return not _is_identity_transform(transform)
+
+        selected = lf.get_selected_node_names()
+        if not selected:
+            return False
+
+        for name in selected:
+            transform = lf.get_node_transform(name)
+            if not _is_identity_transform(transform):
+                return True
+        return False
+
+    def _can_bake_transform(self) -> bool:
+        if not self._selected:
+            return False
+
+        if len(self._selected) == 1:
+            if not self._state.editing_active or not self._state.editing_node_names or not self._state.transforms_before_edit:
+                return False
+            current = lf.get_node_transform(self._selected[0])
+            if current is None:
+                return False
+            return current != self._state.transforms_before_edit[0]
+
+        if not self._state.multi_editing_active:
+            return False
+        if not self._state.multi_node_names or not self._state.multi_transforms_before:
+            return False
+
+        for name, before in zip(self._state.multi_node_names, self._state.multi_transforms_before):
+            current = lf.get_node_transform(name)
+            if current is not None and current != before:
+                return True
+        return False
+
+    def _transform_action_opacity_cache(self):
+        return (
+            "1" if self._can_reset_transform() else "0.22",
+            "1" if self._can_bake_transform() else "0.22",
+        )
+
     def _on_num_step(self, handle, event, args):
         del handle, event
         if len(args) < 2:
@@ -690,6 +771,20 @@ class TransformControlsController:
             self._force_dirty = True
         elif action == "bake":
             self._commit_active_edit()
+            self._last_state_key = None
+            self._force_dirty = True
+            bake = getattr(lf, "bake_selected_node_transforms", None)
+            if callable(bake):
+                try:
+                    if bake():
+                        self._last_state_key = None
+                        self._force_dirty = True
+                        if len(self._selected) == 1:
+                            self._update_single_node()
+                        elif self._selected:
+                            self._update_multi_selection()
+                except Exception as exc:
+                    print(f"Transform bake failed: {exc}")
 
     def _on_input_focus(self, event):
         if self._focus_active:

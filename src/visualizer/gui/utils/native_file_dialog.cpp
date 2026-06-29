@@ -427,7 +427,7 @@ namespace lfs::vis::gui {
         }
 
         [[nodiscard]] std::vector<DialogFilter> pointCloudFilters() {
-            return {makeFilter("Point Cloud Files", {".ply", ".sog", ".spz", ".usd", ".usda", ".usdc", ".usdz"})};
+            return {makeFilter("Point Cloud Files", {".ply", ".sog", ".spz", ".rad", ".usd", ".usda", ".usdc", ".usdz"})};
         }
 
         [[nodiscard]] std::vector<DialogFilter> meshFilters() {
@@ -663,6 +663,28 @@ namespace lfs::vis::gui {
                                              const std::filesystem::path& defaultPath) {
         std::filesystem::path result;
         runDialog(makeSaveFileRequest(jsonFilters(), defaultPath, defaultName, ".json"), result);
+        return result;
+    }
+
+    std::filesystem::path SavePngFileDialog(const std::string& defaultName,
+                                            const std::filesystem::path& defaultPath) {
+        std::filesystem::path result;
+        runDialog(makeSaveFileRequest(singleExtensionFilter("PNG Image", ".png"),
+                                      defaultPath,
+                                      defaultName,
+                                      ".png"),
+                  result);
+        return result;
+    }
+
+    std::filesystem::path SaveJpgFileDialog(const std::string& defaultName,
+                                            const std::filesystem::path& defaultPath) {
+        std::filesystem::path result;
+        runDialog(makeSaveFileRequest(singleExtensionFilter("JPEG Image", ".jpg"),
+                                      defaultPath,
+                                      defaultName,
+                                      ".jpg"),
+                  result);
         return result;
     }
 

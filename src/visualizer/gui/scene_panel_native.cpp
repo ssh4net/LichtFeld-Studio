@@ -400,6 +400,7 @@ namespace lfs::vis::gui {
         scene_tab_el_ = nullptr;
         history_tab_el_ = nullptr;
         logging_tab_el_ = nullptr;
+        asset_manager_button_el_ = nullptr;
         chip_row_el_ = nullptr;
         summary_model_chip_el_ = nullptr;
         summary_node_chip_el_ = nullptr;
@@ -501,7 +502,6 @@ namespace lfs::vis::gui {
     bool NativeScenePanel::drawDirectCached(const float x, const float y,
                                             const float w, const float h,
                                             const PanelDrawContext& ctx) {
-        (void)ctx;
         if (!ensureInitialized())
             return false;
 
@@ -517,12 +517,16 @@ namespace lfs::vis::gui {
             const std::string action = gui->globalContextMenu().pollResult();
             if (!action.empty() && tree_el_ && tree_el_->executeContextMenuAction(action)) {
                 host_.markContentDirty();
-                return false; // fall back to a live draw so the panel reflects the change
+                host_.drawDirect(x, y, w, h);
+                return true;
             }
         }
 
-        if (shouldSyncPanel(nullptr))
-            return false;
+        if (shouldSyncPanel(nullptr)) {
+            syncPanel(ctx);
+            host_.drawDirect(x, y, w, h);
+            return true;
+        }
 
         return host_.drawDirectCached(x, y, w, h);
     }
@@ -551,6 +555,7 @@ namespace lfs::vis::gui {
         scene_tab_el_ = document_->GetElementById("scene-tab");
         history_tab_el_ = document_->GetElementById("history-tab");
         logging_tab_el_ = document_->GetElementById("logging-tab");
+        asset_manager_button_el_ = document_->GetElementById("asset-manager-button");
         chip_row_el_ = document_->GetElementById("scene-chip-row");
         summary_model_chip_el_ = document_->GetElementById("summary-model-chip");
         summary_node_chip_el_ = document_->GetElementById("summary-node-chip");
@@ -603,8 +608,14 @@ namespace lfs::vis::gui {
                 clear_icon->SetAttribute("src", clear_icon_source);
         }
 
+        if (auto* asset_manager_icon = document_->GetElementById("asset-manager-icon")) {
+            const std::string asset_manager_icon_source = resolveRmlImageSource("icon/archive.png");
+            if (!asset_manager_icon_source.empty())
+                asset_manager_icon->SetAttribute("src", asset_manager_icon_source);
+        }
+
         if (!tree_el_ || !scene_tab_el_ || !history_tab_el_ || !logging_tab_el_ || !chip_row_el_ ||
-            !summary_model_chip_el_ || !summary_node_chip_el_ || !summary_selection_chip_el_ ||
+            !asset_manager_button_el_ || !summary_model_chip_el_ || !summary_node_chip_el_ || !summary_selection_chip_el_ ||
             !summary_filter_chip_el_ || !scene_view_el_ || !search_container_el_ ||
             !filter_input_el_ || !filter_clear_el_ || !empty_state_el_ || !empty_primary_el_ ||
             !empty_secondary_el_ || !history_container_el_ || !history_summary_label_el_ ||
@@ -623,6 +634,7 @@ namespace lfs::vis::gui {
         scene_tab_el_->AddEventListener(Rml::EventId::Click, &listener_);
         history_tab_el_->AddEventListener(Rml::EventId::Click, &listener_);
         logging_tab_el_->AddEventListener(Rml::EventId::Click, &listener_);
+        asset_manager_button_el_->AddEventListener(Rml::EventId::Click, &listener_);
         filter_clear_el_->AddEventListener(Rml::EventId::Click, &listener_);
         history_undo_btn_el_->AddEventListener(Rml::EventId::Click, &listener_);
         history_redo_btn_el_->AddEventListener(Rml::EventId::Click, &listener_);
@@ -686,6 +698,7 @@ namespace lfs::vis::gui {
         if (active_tab_ == Tab::Scene) {
             stamp.scene_generation = store.scene_generation.get();
             stamp.selection_generation = store.selection_generation.get();
+            stamp.render_settings_generation = store.render_settings_generation.get();
             if (auto* params = services().paramsOrNull())
                 stamp.invert_masks = params->getActiveParams().invert_masks;
 
@@ -928,6 +941,13 @@ namespace lfs::vis::gui {
         }
         if (id == "logging-tab") {
             setTab(Tab::Logging);
+            event.StopPropagation();
+            return true;
+        }
+        if (id == "asset-manager-button" || id == "asset-manager-icon") {
+            auto& panel_registry = PanelRegistry::instance();
+            const bool currently_open = panel_registry.is_panel_enabled("lfs.asset_manager");
+            panel_registry.set_panel_enabled("lfs.asset_manager", !currently_open);
             event.StopPropagation();
             return true;
         }

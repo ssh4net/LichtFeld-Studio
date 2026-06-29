@@ -333,12 +333,11 @@ namespace lfs::vis::gui {
 
     void SequencerUIManager::restoreViewportCameraState(const sequencer::CameraState& state) const {
         auto& vp = viewer_->getViewport();
-        vp.camera.R = glm::mat3_cast(state.rotation);
-        vp.camera.t = state.position;
+        vp.setViewMatrix(glm::mat3_cast(state.rotation), state.position);
 
         if (auto* const rm = viewer_->getRenderingManager()) {
             rm->setFocalLength(state.focal_length_mm);
-            rm->markDirty(DirtyFlag::CAMERA);
+            rm->markCameraPoseChanged();
         }
     }
 
@@ -1091,12 +1090,11 @@ namespace lfs::vis::gui {
         const bool is_playing = controller_.isPlaying() && controller_.timeline().realKeyframeCount() > 0;
         rm->setOverlayAnimationActive(is_playing);
         if (ui_state_.follow_playback && controller_.timeline().realKeyframeCount() > 0) {
-            rm->markDirty(DirtyFlag::CAMERA);
             const auto state = controller_.currentCameraState();
             auto& vp = viewer_->getViewport();
-            vp.camera.R = glm::mat3_cast(state.rotation);
-            vp.camera.t = state.position;
+            vp.setViewMatrix(glm::mat3_cast(state.rotation), state.position);
             rm->setFocalLength(state.focal_length_mm);
+            rm->markCameraPoseChanged();
         }
     }
 

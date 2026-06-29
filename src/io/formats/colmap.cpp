@@ -9,7 +9,10 @@
 #include "io/filesystem_utils.hpp"
 #include <algorithm>
 #include <cctype>
+#include <charconv>
+#include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <exception>
 #include <filesystem>
@@ -19,6 +22,7 @@
 #include <memory>
 #include <sstream>
 #include <stdexcept>
+#include <system_error>
 #include <unordered_map>
 #include <vector>
 
@@ -35,9 +39,38 @@ namespace lfs::io {
 
     namespace {
         constexpr size_t CANCEL_POLL_INTERVAL = 64;
+        constexpr size_t IMAGE_METADATA_PROBE_LIMIT = 8192;
 
         [[nodiscard]] bool should_poll_cancel(const size_t index) {
             return (index % CANCEL_POLL_INTERVAL) == 0;
+        }
+
+        [[nodiscard]] double elapsed_ms(const std::chrono::high_resolution_clock::time_point start) {
+            return std::chrono::duration<double, std::milli>(
+                       std::chrono::high_resolution_clock::now() - start)
+                .count();
+        }
+
+        void skip_ascii_spaces(const char*& cur, const char* end) {
+            while (cur < end && std::isspace(static_cast<unsigned char>(*cur))) {
+                ++cur;
+            }
+        }
+
+        template <typename T>
+        bool parse_next_number(const char*& cur, const char* end, T& value) {
+            skip_ascii_spaces(cur, end);
+            if (cur >= end) {
+                return false;
+            }
+
+            const auto parsed = std::from_chars(cur, end, value);
+            if (parsed.ec != std::errc{}) {
+                return false;
+            }
+
+            cur = parsed.ptr;
+            return true;
         }
     } // namespace
 
@@ -167,7 +200,14 @@ namespace lfs::io {
         SIMPLE_RADIAL_FISHEYE = 8,
         RADIAL_FISHEYE = 9,
         THIN_PRISM_FISHEYE = 10,
-        UNDEFINED = 11
+        UNDEFINED = 11,
+        // Equirectangular 360 panorama model (COLMAP model id 17, params
+        // [width, height], no intrinsics). Mapped to
+        // CameraModelType::EQUIRECTANGULAR, which the rasterizer handles
+        // natively. Upstream COLMAP names this model "EQUIRECTANGULAR"
+        // (colmap/colmap#4441); the legacy "SPHERICAL" name written by the
+        // original equirectangular fork is still accepted on read.
+        EQUIRECTANGULAR = 17
     };
 
     static const std::unordered_map<int, std::pair<CAMERA_MODEL, int32_t>> camera_model_ids = {
@@ -182,7 +222,8 @@ namespace lfs::io {
         {8, {CAMERA_MODEL::SIMPLE_RADIAL_FISHEYE, 4}},
         {9, {CAMERA_MODEL::RADIAL_FISHEYE, 5}},
         {10, {CAMERA_MODEL::THIN_PRISM_FISHEYE, 12}},
-        {11, {CAMERA_MODEL::UNDEFINED, -1}}};
+        {11, {CAMERA_MODEL::UNDEFINED, -1}},
+        {17, {CAMERA_MODEL::EQUIRECTANGULAR, 2}}};
 
     static const std::unordered_map<std::string, CAMERA_MODEL> camera_model_names = {
         {"SIMPLE_PINHOLE", CAMERA_MODEL::SIMPLE_PINHOLE},
@@ -195,7 +236,18 @@ namespace lfs::io {
         {"FOV", CAMERA_MODEL::FOV},
         {"SIMPLE_RADIAL_FISHEYE", CAMERA_MODEL::SIMPLE_RADIAL_FISHEYE},
         {"RADIAL_FISHEYE", CAMERA_MODEL::RADIAL_FISHEYE},
-        {"THIN_PRISM_FISHEYE", CAMERA_MODEL::THIN_PRISM_FISHEYE}};
+        {"THIN_PRISM_FISHEYE", CAMERA_MODEL::THIN_PRISM_FISHEYE},
+        {"EQUIRECTANGULAR", CAMERA_MODEL::EQUIRECTANGULAR},
+        // Accept the legacy "SPHERICAL" name (written by the original
+        // equirectangular COLMAP fork) as an alias for the same model.
+        {"SPHERICAL", CAMERA_MODEL::EQUIRECTANGULAR}};
+
+    // Placeholder focal length for equirectangular/spherical cameras. They carry
+    // no real intrinsics; the rasterizer reinterprets K for EQUIRECTANGULAR
+    // (focal := full image dimensions, principal point := tile offsets). This
+    // value only keeps the FoV/intrinsics bookkeeping non-degenerate and mirrors
+    // the convention used by the transforms.json loader.
+    static constexpr float EQUIRECTANGULAR_DUMMY_FOCAL = 20.0f;
 
     static const char* camera_model_name(const int model_id) {
         switch (static_cast<CAMERA_MODEL>(model_id)) {
@@ -210,6 +262,9 @@ namespace lfs::io {
         case CAMERA_MODEL::SIMPLE_RADIAL_FISHEYE: return "SIMPLE_RADIAL_FISHEYE";
         case CAMERA_MODEL::RADIAL_FISHEYE: return "RADIAL_FISHEYE";
         case CAMERA_MODEL::THIN_PRISM_FISHEYE: return "THIN_PRISM_FISHEYE";
+        // Write the canonical upstream name so exported reconstructions round-
+        // trip with current COLMAP (which no longer accepts "SPHERICAL").
+        case CAMERA_MODEL::EQUIRECTANGULAR: return "EQUIRECTANGULAR";
         default: return "UNDEFINED";
         }
     }
@@ -366,7 +421,11 @@ namespace lfs::io {
         const std::vector<ImageData>& images,
         const LoadOptions& options = {}) {
 
+        LOG_TIMER_DEBUG("COLMAP validate dataset layout");
         const fs::path images_path = base / lfs::core::utf8_to_path(images_folder);
+        LOG_INFO("[COLMAP_LOAD] validate_layout images={} images_path='{}'",
+                 images.size(),
+                 lfs::core::path_to_utf8(images_path));
         if (!safe_is_directory(images_path)) {
             return make_error(ErrorCode::PATH_NOT_FOUND, "Images folder does not exist", images_path);
         }
@@ -374,6 +433,7 @@ namespace lfs::io {
         const auto basename_layout = scan_image_basename_layout(images_path, options);
         RecursiveFileCache image_cache(images_path, options.cancel_requested);
         MaskDirCache mask_cache(base, options.cancel_requested);
+        DepthDirCache depth_cache(base, options.cancel_requested);
 
         std::unordered_map<std::string, size_t> basename_only_metadata_counts;
         basename_only_metadata_counts.reserve(images.size());
@@ -412,6 +472,14 @@ namespace lfs::io {
             if (auto image_lookup = image_cache.lookup(image_rel_path); image_lookup.found()) {
                 if (auto mask_lookup = mask_cache.lookup(image.name); mask_lookup.ambiguous()) {
                     return make_ambiguous_mask_reference_error(base, image.name);
+                }
+                if (auto depth_lookup = depth_cache.lookup(image.name); depth_lookup.ambiguous()) {
+                    return make_error(
+                        ErrorCode::INVALID_DATASET,
+                        std::format("Depth map for image '{}' is ambiguous across the dataset depth folders. "
+                                    "Keep depth maps in the same relative subdirectories as the images or rename them uniquely.",
+                                    image.name),
+                        base);
                 }
             } else if (image_lookup.ambiguous()) {
                 return make_ambiguous_image_reference_error(images_path, image.name);
@@ -506,6 +574,11 @@ namespace lfs::io {
             params[1] /= factor; // fy
             params[2] /= factor; // cx
             params[3] /= factor; // cy
+            break;
+
+        case CAMERA_MODEL::EQUIRECTANGULAR:
+            params[0] /= factor; // width
+            params[1] /= factor; // height
             break;
 
         default:
@@ -739,6 +812,9 @@ namespace lfs::io {
     std::vector<std::string> read_text_file(const std::filesystem::path& file_path,
                                             const LoadOptions& options = {}) {
         LOG_TRACE("Reading text file: {}", lfs::core::path_to_utf8(file_path));
+        const auto start = std::chrono::high_resolution_clock::now();
+        std::error_code file_size_ec;
+        const auto byte_size = fs::file_size(file_path, file_size_ec);
         std::ifstream file;
         if (!lfs::core::open_file_for_read(file_path, file)) {
             LOG_ERROR("Failed to open text file: {}", lfs::core::path_to_utf8(file_path));
@@ -770,6 +846,11 @@ namespace lfs::io {
             lines.pop_back();
 
         LOG_TRACE("Read {} lines from text file", lines.size());
+        LOG_INFO("[COLMAP_LOAD] read_text_file file='{}' bytes={} data_lines={} elapsed_ms={:.2f}",
+                 lfs::core::path_to_utf8(file_path),
+                 file_size_ec ? std::string("unknown") : std::format("{}", byte_size),
+                 lines.size(),
+                 elapsed_ms(start));
         return lines;
     }
 
@@ -806,6 +887,54 @@ namespace lfs::io {
         return std::isalpha(static_cast<unsigned char>(img.name[dot_pos + 1]));
     }
 
+    bool looks_like_image_metadata_line(const std::string& line) {
+        if (line.size() > IMAGE_METADATA_PROBE_LIMIT) {
+            return false;
+        }
+
+        ImageData img;
+        return parse_image_metadata_line(line, img);
+    }
+
+    bool read_next_short_metadata_line_or_skip(std::ifstream& file,
+                                               std::string& pending_line,
+                                               size_t& file_lines) {
+        pending_line.clear();
+
+        std::string probe;
+        probe.reserve(256);
+
+        char ch = '\0';
+        bool read_any = false;
+        while (file.get(ch)) {
+            read_any = true;
+            if (ch == '\n') {
+                break;
+            }
+            if (probe.size() >= IMAGE_METADATA_PROBE_LIMIT) {
+                file.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+                break;
+            }
+            probe.push_back(ch);
+        }
+
+        if (!read_any) {
+            return false;
+        }
+
+        ++file_lines;
+        if (!probe.empty() && probe.back() == '\r') {
+            probe.pop_back();
+        }
+
+        if (probe.empty() || probe.starts_with("#") || !looks_like_image_metadata_line(probe)) {
+            return false;
+        }
+
+        pending_line = std::move(probe);
+        return true;
+    }
+
     uint64_t parse_point3D_id_token(const std::string& token) {
         if (token == "-1") {
             return INVALID_POINT3D_ID;
@@ -833,12 +962,15 @@ namespace lfs::io {
     //  images.txt
     // -----------------------------------------------------------------------------
     std::vector<ImageData> read_images_text(const std::filesystem::path& file_path,
-                                            const LoadOptions& options = {}) {
+                                            const LoadOptions& options = {},
+                                            const bool parse_points2d = true) {
         LOG_TIMER_TRACE("Read images.txt");
         auto lines = read_text_file(file_path, options);
+        const auto parse_start = std::chrono::high_resolution_clock::now();
 
         std::vector<ImageData> images;
         images.reserve(lines.size());
+        size_t total_points2d = 0;
 
         for (size_t line_idx = 0; line_idx < lines.size(); ++line_idx) {
             if (should_poll_cancel(line_idx)) {
@@ -852,10 +984,17 @@ namespace lfs::io {
             }
 
             if (line_idx + 1 < lines.size()) {
-                ImageData maybe_next_image;
-                if (!parse_image_metadata_line(lines[line_idx + 1], maybe_next_image)) {
-                    img.points2D = parse_points2D_text_line(lines[line_idx + 1]);
-                    ++line_idx;
+                if (!parse_points2d) {
+                    if (!looks_like_image_metadata_line(lines[line_idx + 1])) {
+                        ++line_idx;
+                    }
+                } else {
+                    ImageData maybe_next_image;
+                    if (!parse_image_metadata_line(lines[line_idx + 1], maybe_next_image)) {
+                        img.points2D = parse_points2D_text_line(lines[line_idx + 1]);
+                        total_points2d += img.points2D.size();
+                        ++line_idx;
+                    }
                 }
             }
 
@@ -867,6 +1006,85 @@ namespace lfs::io {
             throw std::runtime_error("No valid images in images.txt");
         }
 
+        LOG_INFO("[COLMAP_LOAD] parse images.txt images={} points2D={} parse_points2D={} source_lines={} elapsed_ms={:.2f}",
+                 images.size(),
+                 total_points2d,
+                 parse_points2d,
+                 lines.size(),
+                 elapsed_ms(parse_start));
+        LOG_DEBUG("Read {} images from text file", images.size());
+        return images;
+    }
+
+    std::vector<ImageData> read_images_text_camera_metadata_only(const std::filesystem::path& file_path,
+                                                                 const LoadOptions& options = {}) {
+        LOG_TIMER_TRACE("Read images.txt camera metadata");
+        const auto start = std::chrono::high_resolution_clock::now();
+        std::error_code file_size_ec;
+        const auto byte_size = fs::file_size(file_path, file_size_ec);
+
+        std::ifstream file;
+        if (!lfs::core::open_file_for_read(file_path, file)) {
+            LOG_ERROR("Failed to open text file: {}", lfs::core::path_to_utf8(file_path));
+            throw std::runtime_error("Failed to open " + lfs::core::path_to_utf8(file_path));
+        }
+
+        std::vector<ImageData> images;
+        std::string line;
+        std::string pending_line;
+        bool has_pending_line = false;
+        size_t file_lines = 0;
+
+        auto read_next_line = [&]() {
+            if (has_pending_line) {
+                line = std::move(pending_line);
+                pending_line.clear();
+                has_pending_line = false;
+                return true;
+            }
+
+            if (!std::getline(file, line)) {
+                return false;
+            }
+
+            ++file_lines;
+            return true;
+        };
+
+        while (read_next_line()) {
+            if (should_poll_cancel(file_lines)) {
+                throw_if_load_cancel_requested(options, "COLMAP image metadata parse cancelled");
+            }
+
+            if (line.starts_with("#")) {
+                continue;
+            }
+            if (!line.empty() && line.back() == '\r') {
+                line.pop_back();
+            }
+            if (line.empty()) {
+                continue;
+            }
+
+            ImageData img;
+            if (!parse_image_metadata_line(line, img)) {
+                continue;
+            }
+
+            images.push_back(std::move(img));
+            has_pending_line = read_next_short_metadata_line_or_skip(file, pending_line, file_lines);
+        }
+
+        if (images.empty()) {
+            LOG_ERROR("No valid images found in {}", lfs::core::path_to_utf8(file_path));
+            throw std::runtime_error("No valid images in images.txt");
+        }
+
+        LOG_INFO("[COLMAP_LOAD] parse images.txt camera_metadata_fast images={} file_lines={} bytes={} elapsed_ms={:.2f}",
+                 images.size(),
+                 file_lines,
+                 file_size_ec ? std::string("unknown") : std::format("{}", byte_size),
+                 elapsed_ms(start));
         LOG_DEBUG("Read {} images from text file", images.size());
         return images;
     }
@@ -933,54 +1151,178 @@ namespace lfs::io {
     //  points3D.txt
     // -----------------------------------------------------------------------------
     std::vector<Point3DData> read_point3D_text_records(const std::filesystem::path& file_path,
-                                                       const LoadOptions& options = {}) {
+                                                       const LoadOptions& options = {},
+                                                       const bool parse_tracks = true) {
         LOG_TIMER_TRACE("Read points3D.txt");
         auto lines = read_text_file(file_path, options);
+        const auto parse_start = std::chrono::high_resolution_clock::now();
         uint64_t N = lines.size();
         LOG_DEBUG("Reading {} 3D points from text file", N);
 
         std::vector<Point3DData> points;
         points.reserve(N);
+        size_t total_track_elements = 0;
 
         for (uint64_t i = 0; i < N; ++i) {
             if (should_poll_cancel(static_cast<size_t>(i))) {
                 throw_if_load_cancel_requested(options, "COLMAP point cloud parse cancelled");
             }
             const auto& line = lines[i];
-            const auto tokens = split_string(line, ' ');
 
-            if (tokens.size() < 8) {
-                LOG_ERROR("Invalid format in points3D.txt: {}", line);
-                throw std::runtime_error("Invalid format in points3D.txt");
+            if (parse_tracks) {
+                const auto tokens = split_string(line, ' ');
+
+                if (tokens.size() < 8) {
+                    LOG_ERROR("Invalid format in points3D.txt: {}", line);
+                    throw std::runtime_error("Invalid format in points3D.txt");
+                }
+
+                Point3DData point;
+                point.point3D_id = std::stoull(tokens[0]);
+                point.xyz[0] = std::stod(tokens[1]);
+                point.xyz[1] = std::stod(tokens[2]);
+                point.xyz[2] = std::stod(tokens[3]);
+
+                point.color[0] = static_cast<uint8_t>(std::stoi(tokens[4]));
+                point.color[1] = static_cast<uint8_t>(std::stoi(tokens[5]));
+                point.color[2] = static_cast<uint8_t>(std::stoi(tokens[6]));
+                point.error = std::stod(tokens[7]);
+
+                for (size_t j = 8; j + 1 < tokens.size(); j += 2) {
+                    point.track.push_back(Point3DTrackElement{
+                        .image_id = static_cast<uint32_t>(std::stoul(tokens[j])),
+                        .point2D_idx = static_cast<uint32_t>(std::stoul(tokens[j + 1])),
+                    });
+                    ++total_track_elements;
+                }
+
+                points.push_back(std::move(point));
+            } else {
+                const char* cur = line.data();
+                const char* end = cur + line.size();
+
+                Point3DData point;
+                int red = 255;
+                int green = 255;
+                int blue = 255;
+                if (!parse_next_number(cur, end, point.point3D_id) ||
+                    !parse_next_number(cur, end, point.xyz[0]) ||
+                    !parse_next_number(cur, end, point.xyz[1]) ||
+                    !parse_next_number(cur, end, point.xyz[2]) ||
+                    !parse_next_number(cur, end, red) ||
+                    !parse_next_number(cur, end, green) ||
+                    !parse_next_number(cur, end, blue) ||
+                    !parse_next_number(cur, end, point.error)) {
+                    LOG_ERROR("Invalid format in points3D.txt: {}", line);
+                    throw std::runtime_error("Invalid format in points3D.txt");
+                }
+
+                point.color[0] = static_cast<uint8_t>(red);
+                point.color[1] = static_cast<uint8_t>(green);
+                point.color[2] = static_cast<uint8_t>(blue);
+                points.push_back(std::move(point));
             }
-
-            Point3DData point;
-            point.point3D_id = std::stoull(tokens[0]);
-            point.xyz[0] = std::stod(tokens[1]);
-            point.xyz[1] = std::stod(tokens[2]);
-            point.xyz[2] = std::stod(tokens[3]);
-
-            point.color[0] = static_cast<uint8_t>(std::stoi(tokens[4]));
-            point.color[1] = static_cast<uint8_t>(std::stoi(tokens[5]));
-            point.color[2] = static_cast<uint8_t>(std::stoi(tokens[6]));
-            point.error = std::stod(tokens[7]);
-
-            for (size_t j = 8; j + 1 < tokens.size(); j += 2) {
-                point.track.push_back(Point3DTrackElement{
-                    .image_id = static_cast<uint32_t>(std::stoul(tokens[j])),
-                    .point2D_idx = static_cast<uint32_t>(std::stoul(tokens[j + 1])),
-                });
-            }
-
-            points.push_back(std::move(point));
         }
 
+        LOG_INFO("[COLMAP_LOAD] parse points3D.txt points={} track_elements={} parse_tracks={} elapsed_ms={:.2f}",
+                 points.size(),
+                 total_track_elements,
+                 parse_tracks,
+                 elapsed_ms(parse_start));
         return points;
     }
 
     PointCloud read_point3D_text(const std::filesystem::path& file_path,
                                  const LoadOptions& options = {}) {
-        return point3D_records_to_point_cloud(read_point3D_text_records(file_path, options));
+        LOG_TIMER_TRACE("Read points3D.txt point cloud");
+        const auto start = std::chrono::high_resolution_clock::now();
+        std::error_code file_size_ec;
+        const auto byte_size = fs::file_size(file_path, file_size_ec);
+
+        std::ifstream file;
+        if (!lfs::core::open_file_for_read(file_path, file)) {
+            LOG_ERROR("Failed to open text file: {}", lfs::core::path_to_utf8(file_path));
+            throw std::runtime_error("Failed to open " + lfs::core::path_to_utf8(file_path));
+        }
+
+        std::vector<float> positions;
+        std::vector<uint8_t> colors;
+        if (!file_size_ec) {
+            const auto estimated_points = static_cast<size_t>(std::max<uintmax_t>(byte_size / 96, 1));
+            positions.reserve(estimated_points * 3);
+            colors.reserve(estimated_points * 3);
+        }
+
+        std::string line;
+        size_t line_count = 0;
+        size_t point_count = 0;
+        while (std::getline(file, line)) {
+            if (should_poll_cancel(line_count)) {
+                throw_if_load_cancel_requested(options, "COLMAP point cloud parse cancelled");
+            }
+            ++line_count;
+
+            if (line.starts_with("#")) {
+                continue;
+            }
+            if (!line.empty() && line.back() == '\r') {
+                line.pop_back();
+            }
+            if (line.empty()) {
+                continue;
+            }
+
+            const char* cur = line.data();
+            const char* end = cur + line.size();
+
+            uint64_t point_id = 0;
+            double x = 0.0;
+            double y = 0.0;
+            double z = 0.0;
+            int red = 255;
+            int green = 255;
+            int blue = 255;
+            double error = 0.0;
+            if (!parse_next_number(cur, end, point_id) ||
+                !parse_next_number(cur, end, x) ||
+                !parse_next_number(cur, end, y) ||
+                !parse_next_number(cur, end, z) ||
+                !parse_next_number(cur, end, red) ||
+                !parse_next_number(cur, end, green) ||
+                !parse_next_number(cur, end, blue) ||
+                !parse_next_number(cur, end, error)) {
+                LOG_ERROR("Invalid format in points3D.txt: {}", line);
+                throw std::runtime_error("Invalid format in points3D.txt");
+            }
+            (void)point_id;
+            (void)error;
+
+            positions.push_back(static_cast<float>(x));
+            positions.push_back(static_cast<float>(y));
+            positions.push_back(static_cast<float>(z));
+            colors.push_back(static_cast<uint8_t>(red));
+            colors.push_back(static_cast<uint8_t>(green));
+            colors.push_back(static_cast<uint8_t>(blue));
+            ++point_count;
+        }
+
+        if (point_count == 0) {
+            LOG_ERROR("No valid points found in {}", lfs::core::path_to_utf8(file_path));
+            throw std::runtime_error("No valid points in points3D.txt");
+        }
+
+        LOG_INFO("[COLMAP_LOAD] parse points3D.txt point_cloud_fast points={} file_lines={} bytes={} elapsed_ms={:.2f}",
+                 point_count,
+                 line_count,
+                 file_size_ec ? std::string("unknown") : std::format("{}", byte_size),
+                 elapsed_ms(start));
+
+        Tensor means = Tensor::from_vector(positions, {point_count, 3}, Device::CUDA);
+        Tensor colors_tensor = Tensor::from_blob(colors.data(), {point_count, 3}, Device::CPU, DataType::UInt8)
+                                   .to(Device::CUDA)
+                                   .contiguous();
+
+        return PointCloud(std::move(means), std::move(colors_tensor));
     }
 
     // -----------------------------------------------------------------------------
@@ -1007,6 +1349,7 @@ namespace lfs::io {
 
         RecursiveFileCache image_cache(images_path, options.cancel_requested);
         MaskDirCache mask_cache(base_path, options.cancel_requested);
+        DepthDirCache depth_cache(base_path, options.cancel_requested);
         bool used_recursive_image_lookup = false;
 
         // Accumulate camera positions for scene center
@@ -1195,6 +1538,18 @@ namespace lfs::io {
                                   std::format("FOV camera model not supported for image '{}'", img.name),
                                   image_path);
 
+            case CAMERA_MODEL::EQUIRECTANGULAR:
+                // Equirectangular 360 panorama. params = [width, height]; no real
+                // intrinsics. The EQUIRECTANGULAR rasterizer derives projection
+                // from the image dimensions, so we only set placeholder focal/center.
+                focal_x = focal_y = EQUIRECTANGULAR_DUMMY_FOCAL;
+                center_x = 0.5f * static_cast<float>(cam_data.width);
+                center_y = 0.5f * static_cast<float>(cam_data.height);
+                radial_dist = Tensor::empty({0}, Device::CPU);
+                tangential_dist = Tensor::empty({0}, Device::CPU);
+                camera_model_type = lfs::core::CameraModelType::EQUIRECTANGULAR;
+                break;
+
             default:
                 return make_error(ErrorCode::UNSUPPORTED_FORMAT,
                                   std::format("Unsupported camera model for image '{}'", img.name),
@@ -1208,9 +1563,28 @@ namespace lfs::io {
                 return make_ambiguous_mask_reference_error(base_path, img.name);
             }
 
-            // Validate mask dimensions match image dimensions
+            std::filesystem::path depth_path;
+            if (auto depth_lookup = depth_cache.lookup(img.name); depth_lookup.found()) {
+                depth_path = std::move(depth_lookup.path);
+            } else if (depth_lookup.ambiguous()) {
+                return make_error(
+                    ErrorCode::INVALID_DATASET,
+                    std::format("Depth map for image '{}' is ambiguous across the dataset depth folders. "
+                                "Keep depth maps in the same relative subdirectories as the images or rename them uniquely.",
+                                img.name),
+                    base_path);
+            }
+
+            // Validate mask/depth dimensions match image dimensions
+            std::optional<std::tuple<int, int, int>> image_info;
+            auto get_image_info_cached = [&]() {
+                if (!image_info.has_value()) {
+                    image_info = lfs::core::get_image_info(image_path);
+                }
+                return *image_info;
+            };
             if (!mask_path.empty()) {
-                auto [img_w, img_h, img_c] = lfs::core::get_image_info(image_path);
+                auto [img_w, img_h, img_c] = get_image_info_cached();
                 auto [mask_w, mask_h, mask_c] = lfs::core::get_image_info(mask_path);
                 if (img_w != mask_w || img_h != mask_h) {
                     return make_error(ErrorCode::MASK_SIZE_MISMATCH,
@@ -1218,6 +1592,17 @@ namespace lfs::io {
                                                   lfs::core::path_to_utf8(mask_path.filename()), mask_w, mask_h,
                                                   img.name, img_w, img_h),
                                       mask_path);
+                }
+            }
+            if (!depth_path.empty()) {
+                auto [img_w, img_h, img_c] = get_image_info_cached();
+                auto [depth_w, depth_h, depth_c] = lfs::core::get_image_info(depth_path);
+                if (img_w != depth_w || img_h != depth_h) {
+                    return make_error(ErrorCode::DEPTH_SIZE_MISMATCH,
+                                      std::format("Depth map '{}' is {}x{} but image '{}' is {}x{}",
+                                                  lfs::core::path_to_utf8(depth_path.filename()), depth_w, depth_h,
+                                                  img.name, img_w, img_h),
+                                      depth_path);
                 }
             }
 
@@ -1236,7 +1621,8 @@ namespace lfs::io {
                 cam_data.width,
                 cam_data.height,
                 static_cast<int>(i),
-                static_cast<int>(img.camera_id));
+                static_cast<int>(img.camera_id),
+                depth_path);
 
             camera->precompute_undistortion();
 
@@ -1870,7 +2256,7 @@ namespace lfs::io {
             if (has_binary_pair) {
                 images = read_images_binary(images_bin, options);
             } else {
-                images = read_images_text(images_txt, options);
+                images = read_images_text_camera_metadata_only(images_txt, options);
             }
 
             return validate_colmap_dataset_layout_impl(base, images_folder, images, options);
@@ -1927,7 +2313,7 @@ namespace lfs::io {
         fs::path images_file = get_sparse_file_path(base, "images.txt");
 
         auto cam_map = read_cameras_text(cams_file, scale_factor, options);
-        auto images = read_images_text(images_file, options);
+        auto images = read_images_text_camera_metadata_only(images_file, options);
 
         LOG_INFO("Read {} cameras and {} images from COLMAP text files", cam_map.size(), images.size());
 
@@ -1959,7 +2345,7 @@ namespace lfs::io {
             images = read_images_binary(sparse_path / "images.bin");
         } else {
             cam_map = read_cameras_text(sparse_path / "cameras.txt", scale_factor);
-            images = read_images_text(sparse_path / "images.txt");
+            images = read_images_text_camera_metadata_only(sparse_path / "images.txt");
         }
 
         LOG_INFO("Read {} cameras and {} images from COLMAP", cam_map.size(), images.size());
@@ -2118,6 +2504,18 @@ namespace lfs::io {
                 return make_error(ErrorCode::UNSUPPORTED_FORMAT,
                                   std::format("FOV camera model not supported for image '{}'", img.name),
                                   sparse_path);
+
+            case CAMERA_MODEL::EQUIRECTANGULAR:
+                // Equirectangular 360 panorama. params = [width, height]; no real
+                // intrinsics. The EQUIRECTANGULAR rasterizer derives projection
+                // from the image dimensions, so we only set placeholder focal/center.
+                focal_x = focal_y = EQUIRECTANGULAR_DUMMY_FOCAL;
+                center_x = 0.5f * static_cast<float>(cam_data.width);
+                center_y = 0.5f * static_cast<float>(cam_data.height);
+                radial_dist = Tensor::empty({0}, Device::CPU);
+                tangential_dist = Tensor::empty({0}, Device::CPU);
+                camera_model_type = lfs::core::CameraModelType::EQUIRECTANGULAR;
+                break;
 
             default:
                 return make_error(ErrorCode::UNSUPPORTED_FORMAT,

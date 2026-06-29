@@ -842,16 +842,12 @@ NB_MODULE(lichtfeld, m) {
     m.def(
         "export_scene",
         [](int format, const std::string& path, const std::vector<std::string>& node_names, int sh_degree,
-           const std::optional<std::vector<float>>& rad_lod_ratios, bool rad_flip_y) {
-            std::vector<float> lod_ratios;
-            if (rad_lod_ratios.has_value()) {
-                lod_ratios = rad_lod_ratios.value();
-            }
-            lfs::python::invoke_export(format, path, node_names, sh_degree, lod_ratios, rad_flip_y);
+           bool rad_flip_y, bool rad_streamable) {
+            lfs::python::invoke_export(format, path, node_names, sh_degree, rad_flip_y, rad_streamable);
         },
         nb::arg("format"), nb::arg("path"), nb::arg("node_names"), nb::arg("sh_degree"),
-        nb::arg("rad_lod_ratios") = nb::none(),
         nb::arg("rad_flip_y") = false,
+        nb::arg("rad_streamable") = true,
         "Export scene nodes to file. Format: 0=PLY, 1=SOG, 2=SPZ, 3=HTML, 4=USD, 5=USDZ NuRec, 6=RAD, 7=COLMAP.");
 
     m.def(
@@ -1010,6 +1006,12 @@ NB_MODULE(lichtfeld, m) {
     // Scene manipulation
     m.def(
         "set_node_visibility", [](const std::string& name, bool visible) {
+            if (auto* scene = get_scene_internal()) {
+                if (const auto* node = scene->getNode(name)) {
+                    lfs::core::events::cmd::SetNodeVisibilityById{.node_id = node->id, .visible = visible}.emit();
+                    return;
+                }
+            }
             lfs::core::events::cmd::SetPLYVisibility{.name = name, .visible = visible}.emit();
         },
         nb::arg("name"), nb::arg("visible"), "Set visibility of a scene node by name");
@@ -1045,6 +1047,12 @@ NB_MODULE(lichtfeld, m) {
 
     m.def(
         "remove_node", [](const std::string& name, bool keep_children) {
+            if (auto* scene = get_scene_internal()) {
+                if (const auto* node = scene->getNode(name)) {
+                    lfs::core::events::cmd::RemoveNodeById{.node_id = node->id, .keep_children = keep_children}.emit();
+                    return;
+                }
+            }
             lfs::core::events::cmd::RemovePLY{.name = name, .keep_children = keep_children}.emit();
         },
         nb::arg("name"), nb::arg("keep_children") = false, "Remove a scene node by name");
@@ -1081,18 +1089,49 @@ NB_MODULE(lichtfeld, m) {
 
     m.def(
         "reparent_node", [](const std::string& name, const std::string& new_parent) {
+            if (auto* scene = get_scene_internal()) {
+                const auto* node = scene->getNode(name);
+                if (!node)
+                    return;
+                lfs::core::NodeId parent_id = lfs::core::NULL_NODE;
+                if (!new_parent.empty()) {
+                    const auto* parent = scene->getNode(new_parent);
+                    if (!parent)
+                        return;
+                    parent_id = parent->id;
+                }
+                lfs::core::events::cmd::ReparentNodeById{.node_id = node->id, .new_parent_id = parent_id}.emit();
+                return;
+            }
             lfs::core::events::cmd::ReparentNode{.node_name = name, .new_parent_name = new_parent}.emit();
         },
         nb::arg("name"), nb::arg("new_parent"), "Move a node under a new parent node");
 
     m.def(
         "rename_node", [](const std::string& old_name, const std::string& new_name) {
+            if (auto* scene = get_scene_internal()) {
+                if (const auto* node = scene->getNode(old_name)) {
+                    lfs::core::events::cmd::RenameNodeById{.node_id = node->id, .new_name = new_name}.emit();
+                    return;
+                }
+            }
             lfs::core::events::cmd::RenamePLY{.old_name = old_name, .new_name = new_name}.emit();
         },
         nb::arg("old_name"), nb::arg("new_name"), "Rename a scene node");
 
     m.def(
         "add_group", [](const std::string& name, const std::string& parent) {
+            if (auto* scene = get_scene_internal()) {
+                lfs::core::NodeId parent_id = lfs::core::NULL_NODE;
+                if (!parent.empty()) {
+                    const auto* parent_node = scene->getNode(parent);
+                    if (!parent_node)
+                        return;
+                    parent_id = parent_node->id;
+                }
+                lfs::core::events::cmd::AddGroupByParentId{.name = name, .parent_id = parent_id}.emit();
+                return;
+            }
             lfs::core::events::cmd::AddGroup{.name = name, .parent_name = parent}.emit();
         },
         nb::arg("name"), nb::arg("parent") = "", "Add a group node to the scene");
@@ -1323,6 +1362,25 @@ NB_MODULE(lichtfeld, m) {
         nb::arg("name"), nb::arg("matrix"), "Set node visualizer-world transform matrix (16 floats, column-major)");
 
     m.def(
+        "bake_selected_node_transforms", []() -> size_t {
+            auto* sm = lfs::python::get_scene_manager();
+            if (!sm)
+                return 0;
+
+            const auto names = sm->getSelectedNodeNames();
+            if (names.empty())
+                return 0;
+
+            auto result = lfs::vis::cap::bakeNodeTransforms(*sm, names, "transform.bake");
+            if (!result) {
+                LOG_WARN("bake_selected_node_transforms failed: {}", result.error());
+                return 0;
+            }
+            return *result;
+        },
+        "Bake selected SPLAT, POINTCLOUD, and MESH node transforms into their payloads");
+
+    m.def(
         "capture_selection_transforms", []() -> nb::dict {
             const auto* sm = lfs::python::get_scene_manager();
             nb::dict result;
@@ -1444,6 +1502,12 @@ NB_MODULE(lichtfeld, m) {
     m.def(
         "reset_camera", []() { lfs::core::events::cmd::ResetCamera{}.emit(); },
         "Reset camera to default position and orientation");
+    m.def(
+        "focus_selection", []() -> bool {
+            auto* const controller = lfs::vis::InputController::instance();
+            return controller ? controller->focusSelection() : false;
+        },
+        "Focus the active viewport on the selection, or the whole scene when nothing is selected");
     m.def(
         "get_camera_navigation_mode", []() -> std::string {
             const auto* controller = lfs::vis::InputController::instance();
@@ -2056,7 +2120,7 @@ Mesh-to-Splat:
   lf.get_mesh2splat_error()      - Get error message
 
 Splat Simplify:
-  lf.simplify_splats("name", ratio=..., knn_k=..., merge_cap=..., opacity_prune_threshold=...)
+  lf.simplify_splats("name", ratio=..., lod_base=..., opacity_prune_threshold=...)
                                     - Simplify a splat node into a new output node
   lf.simplify_splat_data_with_history(splat_data, ...)
                                     - Simplify a SplatData value and return output + merge tree
@@ -2111,25 +2175,33 @@ Example:
             "masks_path", [](const lfs::io::DatasetInfo& i) { return lfs::core::path_to_utf8(i.masks_path); },
             "Path to the masks directory")
         .def_prop_ro(
+            "depths_path", [](const lfs::io::DatasetInfo& i) { return lfs::core::path_to_utf8(i.depths_path); },
+            "Path to the depth maps directory")
+        .def_prop_ro(
             "has_masks", [](const lfs::io::DatasetInfo& i) { return i.has_masks; },
             "Whether the dataset includes masks")
+        .def_prop_ro(
+            "has_depths", [](const lfs::io::DatasetInfo& i) { return i.has_depths; },
+            "Whether the dataset includes depth maps")
         .def_prop_ro(
             "image_count", [](const lfs::io::DatasetInfo& i) { return i.image_count; },
             "Number of images in the dataset")
         .def_prop_ro(
             "mask_count", [](const lfs::io::DatasetInfo& i) { return i.mask_count; },
             "Number of masks in the dataset")
+        .def_prop_ro(
+            "depth_count", [](const lfs::io::DatasetInfo& i) { return i.depth_count; },
+            "Number of depth maps in the dataset")
         .def("__repr__", [](const lfs::io::DatasetInfo& i) {
-            return std::format("DatasetInfo(base_path='{}', images={}, masks={})",
-                               lfs::core::path_to_utf8(i.base_path), i.image_count, i.mask_count);
+            return std::format("DatasetInfo(base_path='{}', images={}, masks={}, depths={})",
+                               lfs::core::path_to_utf8(i.base_path), i.image_count, i.mask_count, i.depth_count);
         });
 
     m.def(
         "build_splat_lod_hierarchy",
         [](nb::object source,
            double ratio,
-           int knn_k,
-           double merge_cap,
+           float lod_base,
            float opacity_prune_threshold,
            std::optional<int> max_levels,
            int min_points,
@@ -2139,8 +2211,7 @@ Example:
             return helper(
                 std::move(source),
                 ratio,
-                knn_k,
-                merge_cap,
+                lod_base,
                 opacity_prune_threshold,
                 py_max_levels,
                 min_points,
@@ -2148,8 +2219,7 @@ Example:
         },
         nb::arg("source") = nb::none(),
         nb::arg("ratio") = 0.5,
-        nb::arg("knn_k") = 16,
-        nb::arg("merge_cap") = 0.5,
+        nb::arg("lod_base") = 2.0f,
         nb::arg("opacity_prune_threshold") = 0.1f,
         nb::arg("max_levels") = nb::none(),
         nb::arg("min_points") = 1,

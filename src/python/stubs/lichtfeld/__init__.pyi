@@ -261,7 +261,7 @@ def request_exit() -> None:
 def force_exit() -> None:
     """Force immediate application exit (bypasses confirmation)."""
 
-def export_scene(format: int, path: str, node_names: Sequence[str], sh_degree: int, rad_lod_ratios: Sequence[float] | None = None, rad_flip_y: bool = False) -> None:
+def export_scene(format: int, path: str, node_names: Sequence[str], sh_degree: int, rad_flip_y: bool = False, rad_streamable: bool = True) -> None:
     """
     Export scene nodes to file. Format: 0=PLY, 1=SOG, 2=SPZ, 3=HTML, 4=USD, 5=USDZ NuRec, 6=RAD, 7=COLMAP.
     """
@@ -400,6 +400,11 @@ def set_node_transform(name: str, matrix: Sequence[float]) -> None:
 def set_node_visualizer_world_transform(name: str, matrix: Sequence[float]) -> None:
     """Set node visualizer-world transform matrix (16 floats, column-major)"""
 
+def bake_selected_node_transforms() -> int:
+    """
+    Bake selected SPLAT, POINTCLOUD, and MESH node transforms into their payloads
+    """
+
 def capture_selection_transforms() -> dict:
     """Capture transforms of all selected nodes"""
 
@@ -421,6 +426,11 @@ def free_icon(texture_id: int) -> None:
 
 def reset_camera() -> None:
     """Reset camera to default position and orientation"""
+
+def focus_selection() -> bool:
+    """
+    Focus the active viewport on the selection, or the whole scene when nothing is selected
+    """
 
 def get_camera_navigation_mode() -> str:
     """Get the active camera navigation mode ('orbit', 'trackball', or 'fpv')"""
@@ -1110,12 +1120,8 @@ class SplatSimplifyMergeTree:
         """Requested simplify ratio"""
 
     @property
-    def requested_knn_k(self) -> int:
-        """Requested kNN neighborhood size"""
-
-    @property
-    def requested_merge_cap(self) -> float:
-        """Requested per-pass merge cap"""
+    def requested_lod_base(self) -> float:
+        """Requested LOD base factor"""
 
     @property
     def requested_opacity_prune_threshold(self) -> float:
@@ -1156,10 +1162,10 @@ class SplatSimplifyResult:
     def merge_tree(self) -> SplatSimplifyMergeTree:
         """Merge tree describing how the output was formed"""
 
-def simplify_splats(source_name: str, ratio: float = 0.1, knn_k: int = 16, merge_cap: float = 0.5, opacity_prune_threshold: float = 0.10000000149011612) -> None:
+def simplify_splats(source_name: str, ratio: float = 0.1, lod_base: float = 2.0, opacity_prune_threshold: float = 0.10000000149011612) -> None:
     """Simplify a splat node asynchronously and create a new output node."""
 
-def simplify_splat_data_with_history(source: scene.SplatData, ratio: float = 0.1, knn_k: int = 16, merge_cap: float = 0.5, opacity_prune_threshold: float = 0.10000000149011612, progress: object | None = None) -> SplatSimplifyResult:
+def simplify_splat_data_with_history(source: scene.SplatData, ratio: float = 0.1, lod_base: float = 2.0, opacity_prune_threshold: float = 0.10000000149011612, progress: object | None = None) -> SplatSimplifyResult:
     """
     Synchronously simplify SplatData and return both the simplified output and its merge tree.
     """
@@ -1231,7 +1237,23 @@ def capture_viewport() -> ViewportRender | None:
     Capture viewport render explicitly (may read back from GPU; clones data, safe to use from background threads)
     """
 
-def render_view(rotation: Tensor, translation: Tensor, width: int, height: int, fov: float = 60.0, bg_color: Tensor | None = None) -> Tensor | None:
+def export_viewport_image(path: str, format: str = '', width: int = 0, height: int = 0, transparent: bool = False, jpeg_quality: int = 95) -> dict:
+    """
+    Export the active viewport image to PNG or JPEG.
+
+    Args:
+        path: Output path. The selected format extension is enforced when needed.
+        format: 'png', 'jpg', or empty to infer from path.
+        width: Target width in pixels. If zero with a positive height, preserves viewport aspect.
+        height: Target height in pixels. If both dimensions are zero, captures the current viewport.
+        transparent: For PNG only, export straight RGBA from the preview renderer.
+        jpeg_quality: JPEG compression quality in [1, 100].
+
+    Returns:
+        Dict with path, width, height, channels, format, and transparent.
+    """
+
+def render_view(rotation: Tensor, translation: Tensor, width: int, height: int, fov: float = 60.0, bg_color: Tensor | None = None, with_depth: bool = False, depth_mode: str = 'median') -> object:
     """
     Render scene from arbitrary camera parameters.
 
@@ -1242,12 +1264,17 @@ def render_view(rotation: Tensor, translation: Tensor, width: int, height: int, 
         height: Render height in pixels
         fov: Vertical field of view in degrees (default: 60)
         bg_color: Accepted for compatibility; the Vulkan preview path uses current render settings
+        with_depth: If True, also return the per-pixel linear depth from the same render
+        depth_mode: "median" (default) = depth at 50% transmittance (sharp, undefined where
+            coverage < 50%); "expected" = alpha-weighted depth (dense/hole-free, softer at edges)
 
     Returns:
-        CPU Tensor [H, W, 3] RGB image, or None if no active visualizer scene is available
+        with_depth=False: CPU Tensor [H, W, 3] RGB image
+        with_depth=True: tuple (image [H, W, 3], depth [H, W]) of CPU float tensors
+        or None if no active visualizer scene is available
     """
 
-def render_view_u8(rotation: Tensor, translation: Tensor, width: int, height: int, fov: float = 60.0, bg_color: Tensor | None = None) -> Tensor | None:
+def render_view_u8(rotation: Tensor, translation: Tensor, width: int, height: int, fov: float = 60.0, bg_color: Tensor | None = None, orthographic: bool | None = None, ortho_scale: float | None = None) -> Tensor | None:
     """
     Render scene from arbitrary camera parameters as an 8-bit RGB image.
 
@@ -1258,6 +1285,8 @@ def render_view_u8(rotation: Tensor, translation: Tensor, width: int, height: in
         height: Render height in pixels
         fov: Vertical field of view in degrees (default: 60)
         bg_color: Accepted for compatibility; the Vulkan preview path uses current render settings
+        orthographic: Optional projection override. None uses current render settings.
+        ortho_scale: Optional orthographic pixels-per-world-unit override.
 
     Returns:
         CPU uint8 Tensor [H, W, 3] RGB image, or None if no active visualizer scene is available
@@ -1370,6 +1399,11 @@ class RenderSettings:
     def __dir__(self) -> list: ...
 
 def get_render_settings() -> RenderSettings | None: ...
+
+def get_lod_stats() -> dict:
+    """
+    Get LOD statistics: {enabled, selected, budget, levels:[{level, count}, ...]}
+    """
 
 def register_class(cls: object) -> None:
     """Register a class (Panel, Operator, or Menu)"""
@@ -1737,7 +1771,9 @@ class MaskMode(enum.Enum):
 
     IGNORE = 2
 
-    ALPHA_CONSISTENT = 3
+    SEGMENT_AND_IGNORE = 3
+
+    ALPHA_CONSISTENT = 4
 
 class BackgroundMode(enum.Enum):
     SOLID_COLOR = 0
@@ -1876,15 +1912,6 @@ class OptimizationParams:
 
     @enable_eval.setter
     def enable_eval(self, arg: bool, /) -> None: ...
-
-    @property
-    def tile_mode(self) -> int:
-        """
-        Tile mode for 3DGUT training only (1, 2, or 4; ignored for 3DGS/FastGS)
-        """
-
-    @tile_mode.setter
-    def tile_mode(self, arg: int, /) -> None: ...
 
     @property
     def steps_scaler(self) -> float:
@@ -2028,6 +2055,27 @@ class OptimizationParams:
     def use_alpha_as_mask(self, arg: bool, /) -> None: ...
 
     @property
+    def use_depth_loss(self) -> bool:
+        """Load depth maps and use depth-map supervision during training"""
+
+    @use_depth_loss.setter
+    def use_depth_loss(self, arg: bool, /) -> None: ...
+
+    @property
+    def depth_loss_weight(self) -> float:
+        """Weight for depth-map supervision"""
+
+    @depth_loss_weight.setter
+    def depth_loss_weight(self, arg: float, /) -> None: ...
+
+    @property
+    def depth_loss_mode(self) -> str:
+        """Depth supervision mode: 'pearson' or 'adaptive-warped-l1'"""
+
+    @depth_loss_mode.setter
+    def depth_loss_mode(self, arg: str, /) -> None: ...
+
+    @property
     def undistort(self) -> bool:
         """Undistort images on-the-fly before training"""
 
@@ -2148,7 +2196,7 @@ class DatasetParams:
     @property
     def centralize_dataset(self) -> str:
         """
-        Dataset centralization mode used for the last load: 'none', 'auto', 'by_pointcloud', 'by_cameras'
+        Dataset centralization mode used for the last load: 'off', 'by_pointcloud', 'by_cameras'
         """
 
 def dataset_params() -> DatasetParams:
@@ -2225,8 +2273,16 @@ class DatasetInfo:
         """Path to the masks directory"""
 
     @property
+    def depths_path(self) -> str:
+        """Path to the depth maps directory"""
+
+    @property
     def has_masks(self) -> bool:
         """Whether the dataset includes masks"""
+
+    @property
+    def has_depths(self) -> bool:
+        """Whether the dataset includes depth maps"""
 
     @property
     def image_count(self) -> int:
@@ -2236,9 +2292,13 @@ class DatasetInfo:
     def mask_count(self) -> int:
         """Number of masks in the dataset"""
 
+    @property
+    def depth_count(self) -> int:
+        """Number of depth maps in the dataset"""
+
     def __repr__(self) -> str: ...
 
-def build_splat_lod_hierarchy(source: object | None = None, ratio: float = 0.5, knn_k: int = 16, merge_cap: float = 0.5, opacity_prune_threshold: float = 0.10000000149011612, max_levels: int | None = None, min_points: int = 1, progress: object | None = None) -> object:
+def build_splat_lod_hierarchy(source: object | None = None, ratio: float = 0.5, lod_base: float = 2.0, opacity_prune_threshold: float = 0.10000000149011612, max_levels: int | None = None, min_points: int = 1, progress: object | None = None) -> object:
     """
     Build a script-side multi-level LOD hierarchy from SplatData or a scene node.
     """

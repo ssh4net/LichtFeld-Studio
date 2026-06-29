@@ -104,7 +104,16 @@ namespace lfs::vis {
             const bool camera_drag = drag_mode_ == DragMode::Orbit ||
                                      drag_mode_ == DragMode::Pan ||
                                      drag_mode_ == DragMode::Rotate;
-            return movement_active || camera_drag;
+            auto& keyboard_camera = activeKeyboardViewport().camera;
+            const bool orbit_coasting =
+                orbit_coast_viewport_ && orbit_coast_viewport_->camera.hasOrbitMomentum();
+            const bool pan_coasting =
+                pan_coast_viewport_ && pan_coast_viewport_->camera.hasPanMomentum();
+            const bool wasd_coasting =
+                (wasd_momentum_viewport_ && wasd_momentum_viewport_->camera.hasWasdMomentum()) ||
+                keyboard_camera.hasWasdMomentum();
+            return movement_active || camera_drag || orbit_coasting || pan_coasting ||
+                   keyboard_camera.isGliding() || wasd_coasting;
         }
         [[nodiscard]] bool hasViewportKeyboardFocus() const;
         [[nodiscard]] bool isViewportPoint(double x, double y) const { return isInViewport(x, y); }
@@ -123,6 +132,7 @@ namespace lfs::vis {
         void handleKey(int physical_key, int logical_key, int scancode, int action, int mods);
         void handleFileDrop(const std::vector<std::string>& paths);
         void onWindowFocusLost();
+        bool focusSelection();
 
     private:
         struct PanelInteractionState {
@@ -138,6 +148,10 @@ namespace lfs::vis {
 
         void handleGoToCamView(const lfs::core::events::cmd::GoToCamView& event);
         bool handleFocusSelection(Viewport& target_viewport);
+        bool computeWholeSceneBounds(glm::vec3& out_min, glm::vec3& out_max,
+                                     bool use_percentile = false) const;
+        float sceneExtent();
+        void maybeInitializeDepthViewRange();
 
         // WASD processing with proper frame timing
         void processWASDMovement();
@@ -165,6 +179,7 @@ namespace lfs::vis {
         std::pair<glm::vec3, glm::vec3> computePickRay(double x, double y) const;
         input::ToolMode getCurrentToolMode() const;
         void clearViewportDragState();
+        void clearWasdMomentumViewport();
         void clearSelectedCameraContextMenuGesture();
         void beginPanDrag(const PanelInteractionState& interaction, int button, double x, double y);
         [[nodiscard]] bool canOpenSelectedCameraContextMenu(int hovered_camera_uid) const;
@@ -211,6 +226,18 @@ namespace lfs::vis {
         float splitter_start_pos_ = 0.5f;
         double splitter_start_x_ = 0.0;
         Viewport* drag_viewport_ = nullptr;
+        Viewport* orbit_coast_viewport_ = nullptr;
+        Viewport* pan_coast_viewport_ = nullptr;
+        Viewport* wasd_momentum_viewport_ = nullptr;
+
+        // Cached whole-scene radius (half the bounds diagonal) that scales WASD
+        // speed and caps pan distance by splat size; 0 means "recompute" (after scene
+        // load/clear).
+        float scene_extent_ = 0.0f;
+        // One-shot guard: the depth-view range is seeded from the trimmed scene
+        // radius the first frame the extent is known after a load, then left to
+        // the user. Reset on scene load/clear.
+        bool depth_range_initialized_ = false;
         SplitViewPanelId drag_split_panel_ = SplitViewPanelId::Left;
         SplitViewPanelId node_rect_panel_ = SplitViewPanelId::Left;
         int node_rect_button_ = -1;

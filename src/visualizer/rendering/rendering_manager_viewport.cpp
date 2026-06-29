@@ -25,6 +25,12 @@ namespace lfs::vis {
         constexpr std::size_t kPreviewPixelStateBytesPerPixel = 4u * sizeof(float);
         constexpr std::size_t kMaxNativePreviewPixelStateBytes =
             (std::size_t{4} << 30) - (std::size_t{64} << 20);
+        constexpr float kMaxValidDepth = 1e9f;
+        // Upper bound on the synchronous capacity self-heal passes a one-shot
+        // preview/export capture will run before reading back (see
+        // renderPreviewImageToPreviewSlotWithState). Typical convergence is
+        // 2-4 passes; the cap only guards a pathological non-converging case.
+        constexpr int kMaxPreviewSettlePasses = 8;
 
         [[nodiscard]] std::optional<std::shared_lock<std::shared_mutex>> acquireLiveModelRenderLock(
             const SceneManager* const scene_manager) {
@@ -51,6 +57,35 @@ namespace lfs::vis {
             }
             const std::size_t max_pixels = kMaxNativePreviewPixelStateBytes / kPreviewPixelStateBytesPerPixel;
             return std::max(1, static_cast<int>(max_pixels / static_cast<std::size_t>(width)));
+        }
+
+        [[nodiscard]] std::optional<float> sampleDepthTensorAt(
+            const lfs::core::Tensor& depth,
+            const glm::ivec2& pixel) {
+            if (!depth.is_valid() ||
+                depth.device() != lfs::core::Device::CPU ||
+                depth.dtype() != lfs::core::DataType::Float32 ||
+                depth.ndim() != 2 ||
+                !depth.is_contiguous()) {
+                return std::nullopt;
+            }
+            const int width = static_cast<int>(depth.size(1));
+            const int height = static_cast<int>(depth.size(0));
+            if (width <= 0 || height <= 0 ||
+                pixel.x < 0 || pixel.y < 0 ||
+                pixel.x >= width || pixel.y >= height) {
+                return std::nullopt;
+            }
+            const float* const values = depth.ptr<float>();
+            if (!values) {
+                return std::nullopt;
+            }
+            const float value = values[static_cast<std::size_t>(pixel.y) * static_cast<std::size_t>(width) +
+                                       static_cast<std::size_t>(pixel.x)];
+            if (!std::isfinite(value) || value <= 0.0f || value >= kMaxValidDepth) {
+                return std::nullopt;
+            }
+            return value;
         }
 
         [[nodiscard]] lfs::rendering::CameraIntrinsics previewTileIntrinsics(
@@ -296,12 +331,40 @@ namespace lfs::vis {
         return hovered_camera;
     }
 
+    RenderingManager::PreviewImageReadbackConfig RenderingManager::previewImageReadbackConfig(
+        const PreviewImageReadback readback,
+        const bool has_background_color_override) {
+        PreviewImageReadbackConfig config{};
+        switch (readback) {
+        case PreviewImageReadback::FloatRgb:
+            config.dtype = lfs::core::DataType::Float32;
+            config.channels = 3;
+            break;
+        case PreviewImageReadback::UInt8Rgb:
+            config.dtype = lfs::core::DataType::UInt8;
+            config.channels = 3;
+            break;
+        case PreviewImageReadback::UInt8Rgba:
+            config.dtype = lfs::core::DataType::UInt8;
+            config.channels = 4;
+            config.transparent_background_override = true;
+            break;
+        }
+        if (has_background_color_override && !config.transparent_background_override.has_value()) {
+            config.transparent_background_override = false;
+        }
+        return config;
+    }
+
     std::shared_ptr<lfs::core::Tensor> RenderingManager::renderPreviewImage(SceneManager* const scene_manager,
                                                                             const glm::mat3& rotation,
                                                                             const glm::vec3& position,
                                                                             const float focal_length_mm,
                                                                             const int width,
-                                                                            const int height) {
+                                                                            const int height,
+                                                                            std::optional<glm::vec3> background_color_override,
+                                                                            std::optional<bool> orthographic_override,
+                                                                            std::optional<float> ortho_scale_override) {
         if (width <= 0 || height <= 0) {
             return {};
         }
@@ -323,7 +386,10 @@ namespace lfs::vis {
                 width,
                 height,
                 render_lock.has_value(),
-                lfs::core::DataType::Float32);
+                background_color_override,
+                orthographic_override,
+                ortho_scale_override,
+                PreviewImageReadback::FloatRgb);
         }
 
         return renderPreviewImageWithState(
@@ -337,7 +403,128 @@ namespace lfs::vis {
             height,
             render_lock.has_value(),
             std::nullopt,
-            lfs::core::DataType::Float32);
+            orthographic_override,
+            ortho_scale_override,
+            background_color_override,
+            PreviewImageReadback::FloatRgb);
+    }
+
+    std::expected<void, std::string> RenderingManager::renderDepthCaptureToPreviewSlotWithState(
+        SceneManager* const scene_manager,
+        const lfs::core::SplatData& model,
+        SceneRenderState scene_state,
+        const glm::mat3& rotation,
+        const glm::vec3& position,
+        const float focal_length_mm,
+        const int width,
+        const int height,
+        const bool render_lock_held,
+        const bool expected_depth,
+        std::optional<glm::vec3> background_color_override,
+        std::optional<bool> orthographic_override,
+        std::optional<float> ortho_scale_override) {
+        if (width <= 0 || height <= 0) {
+            return std::unexpected("invalid preview depth render dimensions");
+        }
+        if (!hasRenderableGaussians(&model)) {
+            return std::unexpected("no renderable Gaussian model is available");
+        }
+        if (previewRenderNeedsTiling(width, height)) {
+            // Depth comes from the single per-frame pixel_depth scratch; a tiled
+            // render would need per-tile depth assembly, which isn't wired yet.
+            LOG_WARN("render_view depth unavailable for tiled preview size {}x{}", width, height);
+            return std::unexpected("preview depth render would require tiled depth assembly");
+        }
+
+        // The macro-tile (HiGS) chain only yields per-macro-tile median depth;
+        // force the legacy per-pixel chain for the depth-capture render so the
+        // readback matches the image resolution.
+        if (!vksplat_viewport_renderer_) {
+            vksplat_viewport_renderer_ = std::make_unique<VksplatViewportRenderer>();
+        }
+        vksplat_viewport_renderer_->setDepthCaptureMode(true, expected_depth);
+        struct DepthCaptureModeGuard {
+            VksplatViewportRenderer* renderer;
+            ~DepthCaptureModeGuard() { renderer->setDepthCaptureMode(false); }
+        } depth_capture_guard{vksplat_viewport_renderer_.get()};
+
+        auto rendered = renderPreviewImageToPreviewSlotWithState(
+            scene_manager,
+            model,
+            std::move(scene_state),
+            rotation,
+            position,
+            focal_length_mm,
+            width,
+            height,
+            render_lock_held,
+            std::nullopt,
+            {},
+            {},
+            orthographic_override,
+            ortho_scale_override,
+            background_color_override,
+            std::nullopt);
+        return rendered;
+    }
+
+    RenderingManager::PreviewRgbd RenderingManager::renderPreviewImageAndDepth(
+        SceneManager* const scene_manager,
+        const glm::mat3& rotation,
+        const glm::vec3& position,
+        const float focal_length_mm,
+        const int width,
+        const int height,
+        const bool expected_depth,
+        std::optional<glm::vec3> background_color_override) {
+        PreviewRgbd result{};
+        if (width <= 0 || height <= 0) {
+            return result;
+        }
+        auto render_lock = acquireLiveModelRenderLock(scene_manager);
+        auto render_state = scene_manager ? scene_manager->buildRenderState() : SceneRenderState{};
+        const auto* const model = render_state.combined_model;
+        if (!hasRenderableGaussians(model)) {
+            return result;
+        }
+
+        auto rendered = renderDepthCaptureToPreviewSlotWithState(
+            scene_manager,
+            *model,
+            std::move(render_state),
+            rotation,
+            position,
+            focal_length_mm,
+            width,
+            height,
+            render_lock.has_value(),
+            expected_depth,
+            background_color_override,
+            std::nullopt,
+            std::nullopt);
+        if (!rendered) {
+            LOG_ERROR("Gaussian preview rgbd render failed: {}", rendered.error());
+            return result;
+        }
+
+        // image and depth are read from the same render: the Preview output slot
+        // and the pixel_depth scratch it just wrote (still resident — the Preview
+        // path uses private scratch, which render() does not release).
+        auto image = vksplat_viewport_renderer_->readOutputImage(
+            *last_vulkan_context_, VksplatViewportRenderer::OutputSlot::Preview);
+        if (!image) {
+            LOG_ERROR("Gaussian preview rgbd image readback failed: {}", image.error());
+            return result;
+        }
+        auto depth = vksplat_viewport_renderer_->readPreviewDepth(
+            *last_vulkan_context_, VksplatViewportRenderer::OutputSlot::Preview);
+        if (!depth) {
+            LOG_ERROR("Gaussian preview depth readback failed: {}", depth.error());
+            return result;
+        }
+        result.image = std::move(*image);
+        result.depth = std::move(*depth);
+        return result;
     }
 
     std::shared_ptr<lfs::core::Tensor> RenderingManager::renderPreviewImageRgb8(SceneManager* const scene_manager,
@@ -345,7 +532,10 @@ namespace lfs::vis {
                                                                                 const glm::vec3& position,
                                                                                 const float focal_length_mm,
                                                                                 const int width,
-                                                                                const int height) {
+                                                                                const int height,
+                                                                                std::optional<glm::vec3> background_color_override,
+                                                                                std::optional<bool> orthographic_override,
+                                                                                std::optional<float> ortho_scale_override) {
         if (width <= 0 || height <= 0) {
             return {};
         }
@@ -367,7 +557,10 @@ namespace lfs::vis {
                 width,
                 height,
                 render_lock.has_value(),
-                lfs::core::DataType::UInt8);
+                background_color_override,
+                orthographic_override,
+                ortho_scale_override,
+                PreviewImageReadback::UInt8Rgb);
         }
 
         return renderPreviewImageWithState(
@@ -381,7 +574,64 @@ namespace lfs::vis {
             height,
             render_lock.has_value(),
             std::nullopt,
-            lfs::core::DataType::UInt8);
+            orthographic_override,
+            ortho_scale_override,
+            background_color_override,
+            PreviewImageReadback::UInt8Rgb,
+            /*settle_capacity=*/true);
+    }
+
+    std::shared_ptr<lfs::core::Tensor> RenderingManager::renderPreviewImageRgba8(SceneManager* const scene_manager,
+                                                                                 const glm::mat3& rotation,
+                                                                                 const glm::vec3& position,
+                                                                                 const float focal_length_mm,
+                                                                                 const int width,
+                                                                                 const int height,
+                                                                                 std::optional<bool> orthographic_override,
+                                                                                 std::optional<float> ortho_scale_override) {
+        if (width <= 0 || height <= 0) {
+            return {};
+        }
+        auto render_lock = acquireLiveModelRenderLock(scene_manager);
+        auto render_state = scene_manager ? scene_manager->buildRenderState() : SceneRenderState{};
+        const auto* const model = render_state.combined_model;
+        if (!hasRenderableGaussians(model)) {
+            return {};
+        }
+
+        if (previewRenderNeedsTiling(width, height)) {
+            return renderPreviewImageTiledWithState(
+                scene_manager,
+                *model,
+                std::move(render_state),
+                rotation,
+                position,
+                focal_length_mm,
+                width,
+                height,
+                render_lock.has_value(),
+                std::nullopt,
+                orthographic_override,
+                ortho_scale_override,
+                PreviewImageReadback::UInt8Rgba);
+        }
+
+        return renderPreviewImageWithState(
+            scene_manager,
+            *model,
+            std::move(render_state),
+            rotation,
+            position,
+            focal_length_mm,
+            width,
+            height,
+            render_lock.has_value(),
+            std::nullopt,
+            orthographic_override,
+            ortho_scale_override,
+            std::nullopt,
+            PreviewImageReadback::UInt8Rgba,
+            /*settle_capacity=*/true);
     }
 
     std::shared_ptr<lfs::core::Tensor> RenderingManager::renderPreviewImage(const lfs::core::SplatData& model,
@@ -390,7 +640,10 @@ namespace lfs::vis {
                                                                             const glm::vec3& position,
                                                                             const float focal_length_mm,
                                                                             const int width,
-                                                                            const int height) {
+                                                                            const int height,
+                                                                            std::optional<glm::vec3> background_color_override,
+                                                                            std::optional<bool> orthographic_override,
+                                                                            std::optional<float> ortho_scale_override) {
         if (width <= 0 || height <= 0) {
             return {};
         }
@@ -405,7 +658,10 @@ namespace lfs::vis {
                 width,
                 height,
                 false,
-                lfs::core::DataType::Float32);
+                background_color_override,
+                orthographic_override,
+                ortho_scale_override,
+                PreviewImageReadback::FloatRgb);
         }
 
         return renderPreviewImageWithState(
@@ -419,7 +675,10 @@ namespace lfs::vis {
             height,
             false,
             std::nullopt,
-            lfs::core::DataType::Float32);
+            orthographic_override,
+            ortho_scale_override,
+            background_color_override,
+            PreviewImageReadback::FloatRgb);
     }
 
     std::shared_ptr<lfs::core::Tensor> RenderingManager::renderPreviewImageRgb8(const lfs::core::SplatData& model,
@@ -428,7 +687,10 @@ namespace lfs::vis {
                                                                                 const glm::vec3& position,
                                                                                 const float focal_length_mm,
                                                                                 const int width,
-                                                                                const int height) {
+                                                                                const int height,
+                                                                                std::optional<glm::vec3> background_color_override,
+                                                                                std::optional<bool> orthographic_override,
+                                                                                std::optional<float> ortho_scale_override) {
         if (width <= 0 || height <= 0) {
             return {};
         }
@@ -443,7 +705,10 @@ namespace lfs::vis {
                 width,
                 height,
                 false,
-                lfs::core::DataType::UInt8);
+                background_color_override,
+                orthographic_override,
+                ortho_scale_override,
+                PreviewImageReadback::UInt8Rgb);
         }
 
         return renderPreviewImageWithState(
@@ -457,7 +722,56 @@ namespace lfs::vis {
             height,
             false,
             std::nullopt,
-            lfs::core::DataType::UInt8);
+            orthographic_override,
+            ortho_scale_override,
+            background_color_override,
+            PreviewImageReadback::UInt8Rgb);
+    }
+
+    std::shared_ptr<lfs::core::Tensor> RenderingManager::renderPreviewImageRgba8(const lfs::core::SplatData& model,
+                                                                                 SceneRenderState scene_state,
+                                                                                 const glm::mat3& rotation,
+                                                                                 const glm::vec3& position,
+                                                                                 const float focal_length_mm,
+                                                                                 const int width,
+                                                                                 const int height,
+                                                                                 std::optional<bool> orthographic_override,
+                                                                                 std::optional<float> ortho_scale_override) {
+        if (width <= 0 || height <= 0) {
+            return {};
+        }
+        if (previewRenderNeedsTiling(width, height)) {
+            return renderPreviewImageTiledWithState(
+                nullptr,
+                model,
+                std::move(scene_state),
+                rotation,
+                position,
+                focal_length_mm,
+                width,
+                height,
+                false,
+                std::nullopt,
+                orthographic_override,
+                ortho_scale_override,
+                PreviewImageReadback::UInt8Rgba);
+        }
+
+        return renderPreviewImageWithState(
+            nullptr,
+            model,
+            std::move(scene_state),
+            rotation,
+            position,
+            focal_length_mm,
+            width,
+            height,
+            false,
+            std::nullopt,
+            orthographic_override,
+            ortho_scale_override,
+            std::nullopt,
+            PreviewImageReadback::UInt8Rgba);
     }
 
     void RenderingManager::releasePreviewImageResources() {
@@ -477,7 +791,14 @@ namespace lfs::vis {
         const int height,
         const bool render_lock_held,
         std::optional<lfs::rendering::CameraIntrinsics> intrinsics_override,
-        const lfs::core::DataType output_dtype) {
+        std::optional<bool> orthographic_override,
+        std::optional<float> ortho_scale_override,
+        std::optional<glm::vec3> background_color_override,
+        const PreviewImageReadback readback,
+        const bool settle_capacity) {
+        const auto readback_config =
+            previewImageReadbackConfig(readback, background_color_override.has_value());
+
         auto rendered = renderPreviewImageToPreviewSlotWithState(
             scene_manager,
             model,
@@ -490,21 +811,35 @@ namespace lfs::vis {
             render_lock_held,
             std::move(intrinsics_override),
             {},
-            {});
+            {},
+            orthographic_override,
+            ortho_scale_override,
+            background_color_override,
+            readback_config.transparent_background_override,
+            settle_capacity);
         if (!rendered) {
-            LOG_ERROR("DEBUG_VIDEO Gaussian preview image render failed: {}", rendered.error());
+            LOG_ERROR("Gaussian preview image render failed: {}", rendered.error());
             return {};
         }
 
-        auto image = output_dtype == lfs::core::DataType::UInt8
-                         ? vksplat_viewport_renderer_->readOutputImageRgb8(
-                               *last_vulkan_context_,
-                               VksplatViewportRenderer::OutputSlot::Preview)
-                         : vksplat_viewport_renderer_->readOutputImage(
-                               *last_vulkan_context_,
-                               VksplatViewportRenderer::OutputSlot::Preview);
+        std::expected<std::shared_ptr<lfs::core::Tensor>, std::string> image =
+            std::unexpected("unsupported preview image readback format");
+        if (readback_config.dtype == lfs::core::DataType::UInt8 &&
+            readback_config.channels == 4) {
+            image = vksplat_viewport_renderer_->readOutputImageRgba8(
+                *last_vulkan_context_,
+                VksplatViewportRenderer::OutputSlot::Preview);
+        } else if (readback_config.dtype == lfs::core::DataType::UInt8) {
+            image = vksplat_viewport_renderer_->readOutputImageRgb8(
+                *last_vulkan_context_,
+                VksplatViewportRenderer::OutputSlot::Preview);
+        } else {
+            image = vksplat_viewport_renderer_->readOutputImage(
+                *last_vulkan_context_,
+                VksplatViewportRenderer::OutputSlot::Preview);
+        }
         if (!image) {
-            LOG_ERROR("DEBUG_VIDEO Gaussian preview image readback failed: {}", image.error());
+            LOG_ERROR("Gaussian preview image readback failed: {}", image.error());
             return {};
         }
         return std::move(*image);
@@ -522,7 +857,12 @@ namespace lfs::vis {
         const bool render_lock_held,
         std::optional<lfs::rendering::CameraIntrinsics> intrinsics_override,
         const glm::ivec2 subregion_origin,
-        const glm::ivec2 subregion_full_size) {
+        const glm::ivec2 subregion_full_size,
+        std::optional<bool> orthographic_override,
+        std::optional<float> ortho_scale_override,
+        std::optional<glm::vec3> background_color_override,
+        std::optional<bool> transparent_background_override,
+        const bool settle_capacity) {
         if (width <= 0 || height <= 0) {
             return std::unexpected("invalid preview render dimensions");
         }
@@ -543,6 +883,15 @@ namespace lfs::vis {
             lfs::rendering::MAX_FOCAL_LENGTH_MM);
         preview_settings.split_view_mode = SplitViewMode::Disabled;
         preview_settings.equirectangular = false;
+        if (background_color_override) {
+            preview_settings.background_color = *background_color_override;
+        }
+        if (orthographic_override) {
+            preview_settings.orthographic = *orthographic_override;
+        }
+        if (ortho_scale_override && std::isfinite(*ortho_scale_override) && *ortho_scale_override > 0.0f) {
+            preview_settings.ortho_scale = *ortho_scale_override;
+        }
 
         Viewport preview_viewport(
             static_cast<std::size_t>(width),
@@ -564,6 +913,9 @@ namespace lfs::vis {
         };
 
         auto request = buildViewportRenderRequest(frame_ctx, frame_ctx.render_size);
+        if (transparent_background_override) {
+            request.transparent_background = *transparent_background_override;
+        }
         request.frame_view.intrinsics_override = std::move(intrinsics_override);
         request.frame_view.subregion_origin = subregion_origin;
         request.frame_view.subregion_full_size = subregion_full_size;
@@ -580,15 +932,34 @@ namespace lfs::vis {
             vksplat_viewport_renderer_ = std::make_unique<VksplatViewportRenderer>();
         }
 
-        auto render_result = vksplat_viewport_renderer_->render(
-            *last_vulkan_context_,
-            model,
-            request,
-            false,
-            VksplatViewportRenderer::OutputSlot::Preview,
-            false);
-        if (!render_result) {
-            return std::unexpected(render_result.error());
+        // One-shot preview/export captures read the image back immediately, so
+        // they cannot rely on the interactive viewport's one-frame capacity
+        // self-heal. The renderer sizes per-frame scratch (visible-primitive and
+        // tile-instance capacity) from deferred, one-frame-late high-water marks;
+        // the first render at a new viewpoint/resolution — e.g. a high-res export
+        // after the live viewport established marks at a smaller size — can clamp
+        // the depth/tile-ordered tail, dropping content along an irregular edge.
+        // Re-render the Preview slot until the renderer confirms the previous
+        // pass produced complete, unclamped content (each pass grows the marks
+        // via the deferred readback). The pass >= 1 guard ensures the settle
+        // signal reflects this exact view (critical for the tiled path, where
+        // each tile is a different sub-view); max_passes bounds a pathological
+        // case. Non-settling callers (e.g. depth capture) render exactly once.
+        const int max_passes = settle_capacity ? kMaxPreviewSettlePasses : 1;
+        for (int pass = 0; pass < max_passes; ++pass) {
+            auto render_result = vksplat_viewport_renderer_->render(
+                *last_vulkan_context_,
+                model,
+                request,
+                false,
+                VksplatViewportRenderer::OutputSlot::Preview,
+                false);
+            if (!render_result) {
+                return std::unexpected(render_result.error());
+            }
+            if (pass >= 1 && vksplat_viewport_renderer_->previewCaptureSettled()) {
+                break;
+            }
         }
         return {};
     }
@@ -603,10 +974,15 @@ namespace lfs::vis {
         const int width,
         const int height,
         const bool render_lock_held,
-        const lfs::core::DataType output_dtype) {
+        std::optional<glm::vec3> background_color_override,
+        std::optional<bool> orthographic_override,
+        std::optional<float> ortho_scale_override,
+        const PreviewImageReadback readback) {
         if (width <= 0 || height <= 0) {
             return {};
         }
+        const auto readback_config =
+            previewImageReadbackConfig(readback, background_color_override.has_value());
 
         const int tile_width = width;
         const int tile_height_limit = previewTileHeightForWidth(tile_width);
@@ -621,9 +997,11 @@ namespace lfs::vis {
                  tile_height_limit);
 
         auto output = lfs::core::Tensor::empty(
-            {static_cast<std::size_t>(height), static_cast<std::size_t>(width), std::size_t{3}},
+            {static_cast<std::size_t>(height),
+             static_cast<std::size_t>(width),
+             static_cast<std::size_t>(readback_config.channels)},
             lfs::core::Device::CPU,
-            output_dtype);
+            readback_config.dtype);
         if (!output.is_valid()) {
             LOG_TRACE("Gaussian preview tiled render failed to allocate output tensor");
             return {};
@@ -647,7 +1025,12 @@ namespace lfs::vis {
                 render_lock_held,
                 intrinsics,
                 {0, tile_y},
-                {width, height});
+                {width, height},
+                orthographic_override,
+                ortho_scale_override,
+                background_color_override,
+                readback_config.transparent_background_override,
+                /*settle_capacity=*/true);
             if (!rendered) {
                 LOG_TRACE("Gaussian preview tiled render failed at tile y={} height={}: {}",
                           tile_y,
@@ -696,16 +1079,75 @@ namespace lfs::vis {
                               : VksplatViewportRenderer::OutputSlot::SplitLeft;
         }
 
+        glm::ivec2 source_size = frame_lifecycle_service_.lastViewportSize();
+        if (source_size.x > 0 && source_size.y > 0 && panel && isIndependentSplitViewActive()) {
+            if (const auto layouts = split_view_service_.panelLayouts(settings_, source_size.x)) {
+                const auto& layout = (*layouts)[splitViewPanelIndex(*panel)];
+                source_size.x = std::max(layout.width, 1);
+            }
+        }
+
         const auto depth = vksplat_viewport_renderer_->sampleDepthAtPixel(
             *last_vulkan_context_,
-            x,
-            y,
-            output_slot);
+            VksplatViewportRenderer::DepthSampleRequest{
+                .pixel = {x, y},
+                .source_size = source_size,
+                .output_slot = output_slot,
+            });
         if (!depth) {
             LOG_TRACE("VkSplat depth sample failed: {}", depth.error());
             return -1.0f;
         }
         return *depth;
+    }
+
+    float RenderingManager::renderExpectedDepthAtPixel(const ExpectedDepthSampleRequest& request) {
+        if (!request.scene_manager ||
+            !request.viewport ||
+            request.render_size.x <= 0 ||
+            request.render_size.y <= 0 ||
+            request.pixel.x < 0 ||
+            request.pixel.y < 0 ||
+            request.pixel.x >= request.render_size.x ||
+            request.pixel.y >= request.render_size.y) {
+            return -1.0f;
+        }
+
+        auto render_lock = acquireLiveModelRenderLock(request.scene_manager);
+        auto scene_state = request.scene_manager->buildRenderState();
+        const auto* const model = scene_state.combined_model;
+        if (!hasRenderableGaussians(model)) {
+            return -1.0f;
+        }
+
+        auto rendered = renderDepthCaptureToPreviewSlotWithState(
+            request.scene_manager,
+            *model,
+            std::move(scene_state),
+            request.viewport->camera.R,
+            request.viewport->camera.t,
+            request.focal_length_mm,
+            request.render_size.x,
+            request.render_size.y,
+            render_lock.has_value(),
+            true,
+            std::nullopt,
+            request.orthographic,
+            request.ortho_scale);
+        if (!rendered) {
+            LOG_TRACE("Expected-depth pixel render failed: {}", rendered.error());
+            return -1.0f;
+        }
+
+        auto depth = vksplat_viewport_renderer_->readPreviewDepth(
+            *last_vulkan_context_,
+            VksplatViewportRenderer::OutputSlot::Preview);
+        if (!depth) {
+            LOG_TRACE("Expected-depth pixel readback failed: {}", depth.error());
+            return -1.0f;
+        }
+
+        return sampleDepthTensorAt(**depth, request.pixel).value_or(-1.0f);
     }
 
     float RenderingManager::renderDepthAtPixelForNodeMask(const SceneManager* const scene_manager,

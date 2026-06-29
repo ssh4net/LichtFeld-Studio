@@ -82,7 +82,7 @@ namespace lfs::app {
         const core::SceneNode* find_first_visible_splat_node(const core::Scene& scene) {
             for (const auto* node : scene.getNodes()) {
                 if (node->type == core::NodeType::SPLAT && node->model &&
-                    static_cast<bool>(node->visible))
+                    scene.isNodeEffectivelyVisible(node->id))
                     return node;
             }
             return nullptr;
@@ -1162,6 +1162,7 @@ namespace lfs::app {
                 {"image_name", node.camera->image_name()},
                 {"image_path", core::path_to_utf8(node.camera->image_path())},
                 {"mask_path", core::path_to_utf8(node.camera->mask_path())},
+                {"depth_path", core::path_to_utf8(node.camera->depth_path())},
                 {"camera_width", node.camera->camera_width()},
                 {"camera_height", node.camera->camera_height()},
                 {"image_width", node.camera->image_width()},
@@ -2292,12 +2293,16 @@ namespace lfs::app {
                     if (!scene_manager)
                         return json{{"error", "Scene manager not initialized"}};
                     const auto& scene = scene_manager->getScene();
-                    if (!scene.getNode(name))
+                    const auto* const node = scene.getNode(name);
+                    if (!node)
                         return json{{"error", "Node not found: " + name}};
 
-                    core::events::cmd::SetPLYVisibility{.name = name, .visible = visible}.emit();
-                    if (const auto* const node = scene.getNode(name))
-                        return json{{"success", true}, {"node", node_summary_json(scene, *node)}};
+                    core::events::cmd::SetNodeVisibilityById{
+                        .node_id = node->id,
+                        .visible = visible}
+                        .emit();
+                    if (const auto* const updated = scene.getNodeById(node->id))
+                        return json{{"success", true}, {"node", node_summary_json(scene, *updated)}};
                     return json{{"success", true}, {"name", name}, {"visible", visible}};
                 });
             });
@@ -2350,12 +2355,14 @@ namespace lfs::app {
                     if (!scene_manager)
                         return json{{"error", "Scene manager not initialized"}};
                     const auto& scene = scene_manager->getScene();
-                    if (!scene.getNode(old_name))
+                    const auto* const node = scene.getNode(old_name);
+                    if (!node)
                         return json{{"error", "Node not found: " + old_name}};
 
-                    core::events::cmd::RenamePLY{.old_name = old_name, .new_name = new_name}.emit();
-                    if (const auto* const node = scene.getNode(new_name))
-                        return json{{"success", true}, {"node", node_summary_json(scene, *node)}};
+                    core::events::cmd::RenameNodeById{.node_id = node->id, .new_name = new_name}.emit();
+                    if (const auto* const updated = scene.getNodeById(node->id);
+                        updated && updated->name == new_name)
+                        return json{{"success", true}, {"node", node_summary_json(scene, *updated)}};
                     return json{{"error", "Rename did not produce a node named: " + new_name}};
                 });
             });
@@ -2379,14 +2386,26 @@ namespace lfs::app {
                     if (!scene_manager)
                         return json{{"error", "Scene manager not initialized"}};
                     const auto& scene = scene_manager->getScene();
-                    if (!scene.getNode(name))
+                    const auto* const node = scene.getNode(name);
+                    if (!node)
                         return json{{"error", "Node not found: " + name}};
-                    if (parent && !scene.getNode(*parent))
-                        return json{{"error", "Parent node not found: " + *parent}};
+                    core::NodeId parent_id = core::NULL_NODE;
+                    if (parent) {
+                        const auto* const parent_node = scene.getNode(*parent);
+                        if (!parent_node)
+                            return json{{"error", "Parent node not found: " + *parent}};
+                        parent_id = parent_node->id;
+                    }
 
-                    core::events::cmd::ReparentNode{.node_name = name, .new_parent_name = parent.value_or("")}.emit();
-                    if (const auto* const node = scene.getNode(name))
-                        return json{{"success", true}, {"node", node_summary_json(scene, *node)}};
+                    core::events::cmd::ReparentNodeById{
+                        .node_id = node->id,
+                        .new_parent_id = parent_id}
+                        .emit();
+                    if (const auto* const updated = scene.getNodeById(node->id);
+                        updated && updated->parent_id == parent_id)
+                        return json{{"success", true}, {"node", node_summary_json(scene, *updated)}};
+                    if (scene.getNodeById(node->id))
+                        return json{{"error", "Reparent did not move node: " + name}};
                     return json{{"error", "Node disappeared after reparent: " + name}};
                 });
             });
@@ -2410,8 +2429,13 @@ namespace lfs::app {
                     if (!scene_manager)
                         return json{{"error", "Scene manager not initialized"}};
                     const auto& scene = scene_manager->getScene();
-                    if (parent && !scene.getNode(*parent))
-                        return json{{"error", "Parent node not found: " + *parent}};
+                    core::NodeId parent_id = core::NULL_NODE;
+                    if (parent) {
+                        const auto* const parent_node = scene.getNode(*parent);
+                        if (!parent_node)
+                            return json{{"error", "Parent node not found: " + *parent}};
+                        parent_id = parent_node->id;
+                    }
 
                     std::unordered_set<std::string> before;
                     for (const auto* const node : scene.getNodes()) {
@@ -2419,7 +2443,7 @@ namespace lfs::app {
                             before.insert(node->name);
                     }
 
-                    core::events::cmd::AddGroup{.name = name, .parent_name = parent.value_or("")}.emit();
+                    core::events::cmd::AddGroupByParentId{.name = name, .parent_id = parent_id}.emit();
 
                     for (const auto* const node : scene.getNodes()) {
                         if (node && node->type == core::NodeType::GROUP && !before.contains(node->name))
@@ -2447,7 +2471,8 @@ namespace lfs::app {
                     if (!scene_manager)
                         return json{{"error", "Scene manager not initialized"}};
                     const auto& scene = scene_manager->getScene();
-                    if (!scene.getNode(name))
+                    const auto* const node = scene.getNode(name);
+                    if (!node)
                         return json{{"error", "Node not found: " + name}};
 
                     std::unordered_set<std::string> before;
@@ -2456,7 +2481,7 @@ namespace lfs::app {
                             before.insert(node->name);
                     }
 
-                    core::events::cmd::DuplicateNode{.name = name}.emit();
+                    core::events::cmd::DuplicateNodeById{.node_id = node->id}.emit();
 
                     json nodes = json::array();
                     for (const auto* const node : scene.getNodes()) {
@@ -2499,7 +2524,7 @@ namespace lfs::app {
                             before.insert(node->name);
                     }
 
-                    core::events::cmd::MergeGroup{.name = name}.emit();
+                    core::events::cmd::MergeGroupById{.node_id = group->id}.emit();
 
                     for (const auto* const node : scene.getNodes()) {
                         if (node && !before.contains(node->name))
@@ -2884,7 +2909,7 @@ namespace lfs::app {
                         {"x1", json{{"type", "number"}, {"description", "Right edge X coordinate"}}},
                         {"y1", json{{"type", "number"}, {"description", "Bottom edge Y coordinate"}}},
                         {"camera_index", json{{"type", "integer"}, {"description", "Camera index (default: 0)"}}},
-                        {"mode", json{{"type", "string"}, {"enum", json::array({"replace", "add", "remove"})}, {"description", "Selection mode (default: replace)"}}}},
+                        {"mode", json{{"type", "string"}, {"enum", json::array({"replace", "add", "remove", "intersect"})}, {"description", "Selection mode (default: replace)"}}}},
                     .required = {"x0", "y0", "x1", "y1"}}},
             [viewer_impl](const json& args) -> json {
                 const float x0 = args["x0"].get<float>();
@@ -2912,7 +2937,7 @@ namespace lfs::app {
                     .properties = json{
                         {"points", json{{"type", "array"}, {"items", json{{"type", "array"}, {"items", json{{"type", "number"}}}}}, {"description", "Polygon vertices [[x0,y0], [x1,y1], ...]"}}},
                         {"camera_index", json{{"type", "integer"}, {"description", "Camera index (default: 0)"}}},
-                        {"mode", json{{"type", "string"}, {"enum", json::array({"replace", "add", "remove"})}, {"description", "Selection mode (default: replace)"}}}},
+                        {"mode", json{{"type", "string"}, {"enum", json::array({"replace", "add", "remove", "intersect"})}, {"description", "Selection mode (default: replace)"}}}},
                     .required = {"points"}}},
             [viewer_impl](const json& args) -> json {
                 const auto& points = args["points"];
@@ -2947,7 +2972,7 @@ namespace lfs::app {
                     .properties = json{
                         {"points", json{{"type", "array"}, {"items", json{{"type", "array"}, {"items", json{{"type", "number"}}}}}, {"description", "Lasso points [[x0,y0], [x1,y1], ...]"}}},
                         {"camera_index", json{{"type", "integer"}, {"description", "Camera index (default: 0)"}}},
-                        {"mode", json{{"type", "string"}, {"enum", json::array({"replace", "add", "remove"})}, {"description", "Selection mode (default: replace)"}}}},
+                        {"mode", json{{"type", "string"}, {"enum", json::array({"replace", "add", "remove", "intersect"})}, {"description", "Selection mode (default: replace)"}}}},
                     .required = {"points"}}},
             [viewer_impl](const json& args) -> json {
                 const auto& points = args["points"];
@@ -2983,7 +3008,7 @@ namespace lfs::app {
                         {"x", json{{"type", "number"}, {"description", "X coordinate"}}},
                         {"y", json{{"type", "number"}, {"description", "Y coordinate"}}},
                         {"camera_index", json{{"type", "integer"}, {"description", "Camera index (default: 0)"}}},
-                        {"mode", json{{"type", "string"}, {"enum", json::array({"replace", "add", "remove"})}, {"description", "Selection mode (default: replace)"}}}},
+                        {"mode", json{{"type", "string"}, {"enum", json::array({"replace", "add", "remove", "intersect"})}, {"description", "Selection mode (default: replace)"}}}},
                     .required = {"x", "y"}}},
             [viewer_impl](const json& args) -> json {
                 const float x = args["x"].get<float>();
@@ -3011,7 +3036,7 @@ namespace lfs::app {
                         {"y", json{{"type", "number"}, {"description", "Y coordinate"}}},
                         {"radius", json{{"type", "number"}, {"description", "Selection radius in pixels (default: 20)"}}},
                         {"camera_index", json{{"type", "integer"}, {"description", "Camera index (default: 0)"}}},
-                        {"mode", json{{"type", "string"}, {"enum", json::array({"replace", "add", "remove"})}, {"description", "Selection mode (default: replace)"}}}},
+                        {"mode", json{{"type", "string"}, {"enum", json::array({"replace", "add", "remove", "intersect"})}, {"description", "Selection mode (default: replace)"}}}},
                     .required = {"x", "y"}}},
             [viewer_impl](const json& args) -> json {
                 const float x = args["x"].get<float>();
@@ -3040,7 +3065,7 @@ namespace lfs::app {
                         {"y", json{{"type", "number"}, {"description", "Y coordinate"}}},
                         {"radius", json{{"type", "number"}, {"description", "Selection radius in pixels (default: 20)"}}},
                         {"camera_index", json{{"type", "integer"}, {"description", "Camera index (default: 0)"}}},
-                        {"mode", json{{"type", "string"}, {"enum", json::array({"replace", "add", "remove"})}, {"description", "Selection mode (default: replace)"}}}},
+                        {"mode", json{{"type", "string"}, {"enum", json::array({"replace", "add", "remove", "intersect"})}, {"description", "Selection mode (default: replace)"}}}},
                     .required = {"x", "y"}}},
             [viewer_impl](const json& args) -> json {
                 const float x = args["x"].get<float>();
@@ -3121,7 +3146,7 @@ namespace lfs::app {
                     for (const auto* const node : scene.getNodes()) {
                         if (!node)
                             continue;
-                        if (!include_hidden && !static_cast<bool>(node->visible))
+                        if (!include_hidden && !scene.isNodeEffectivelyVisible(node->id))
                             continue;
                         if (!include_auxiliary) {
                             switch (node->type) {

@@ -583,6 +583,61 @@ namespace lfs::python {
             return {static_cast<uint64_t>(result.texture_id), result.width, result.height};
         }
 
+        // SDL returns clipboard payloads keyed by MIME type, chosen by the source app
+        // (browsers use image/png, native copies may use image/bmp, etc.), so scan every
+        // advertised image/* type rather than guessing a fixed set.
+        bool clipboard_has_image() {
+            size_t count = 0;
+            char** mimes = SDL_GetClipboardMimeTypes(&count);
+            if (!mimes)
+                return false;
+            bool found = false;
+            for (size_t i = 0; i < count; ++i) {
+                if (mimes[i] && std::string_view(mimes[i]).starts_with("image/")) {
+                    found = true;
+                    break;
+                }
+            }
+            SDL_free(mimes);
+            return found;
+        }
+
+        // Returns an owning RGB buffer (caller frees with lfs::core::free_image), or
+        // {nullptr, 0, 0, 0} when the clipboard holds no decodable image.
+        std::tuple<unsigned char*, int, int, int> decode_clipboard_image() {
+            size_t count = 0;
+            char** mimes = SDL_GetClipboardMimeTypes(&count);
+            if (!mimes)
+                return {nullptr, 0, 0, 0};
+
+            std::tuple<unsigned char*, int, int, int> image{nullptr, 0, 0, 0};
+            for (size_t i = 0; i < count; ++i) {
+                if (!mimes[i] || !std::string_view(mimes[i]).starts_with("image/"))
+                    continue;
+
+                size_t size = 0;
+                void* raw = SDL_GetClipboardData(mimes[i], &size);
+                if (!raw)
+                    continue;
+                if (size == 0) {
+                    SDL_free(raw);
+                    continue;
+                }
+
+                try {
+                    image = lfs::core::load_image_from_memory(
+                        static_cast<const uint8_t*>(raw), size);
+                } catch (const std::exception& e) {
+                    LOG_WARN("Clipboard image decode failed ({}): {}", mimes[i], e.what());
+                }
+                SDL_free(raw);
+                if (std::get<0>(image))
+                    break;
+            }
+            SDL_free(mimes);
+            return image;
+        }
+
         vis::op::OperatorResult parse_operator_result(nb::object result, nb::object instance = nb::none()) {
             if (nb::isinstance<nb::set>(result)) {
                 nb::set result_set = nb::cast<nb::set>(result);
@@ -3849,7 +3904,7 @@ namespace lfs::python {
                 return result.empty() ? "" : lfs::core::path_to_utf8(result);
             },
             nb::arg("start_dir") = "",
-            "Open a file dialog to select a splat file (.ply, .sog, .spz, .usd, .usda, .usdc, .usdz). Returns empty string if cancelled.");
+            "Open a file dialog to select a splat file (.ply, .sog, .spz, .rad, .usd, .usda, .usdc, .usdz). Returns empty string if cancelled.");
 
         m.def(
             "open_mesh_file_dialog",
@@ -3943,6 +3998,24 @@ namespace lfs::python {
             },
             nb::arg("default_name") = "config.json",
             "Open a save file dialog for JSON files. Returns empty string if cancelled.");
+
+        m.def(
+            "save_png_file_dialog",
+            [](const std::string& default_name) -> std::string {
+                auto result = lfs::vis::gui::SavePngFileDialog(default_name);
+                return result.empty() ? "" : lfs::core::path_to_utf8(result);
+            },
+            nb::arg("default_name") = "export.png",
+            "Open a save file dialog for PNG images. Returns empty string if cancelled.");
+
+        m.def(
+            "save_jpg_file_dialog",
+            [](const std::string& default_name) -> std::string {
+                auto result = lfs::vis::gui::SaveJpgFileDialog(default_name);
+                return result.empty() ? "" : lfs::core::path_to_utf8(result);
+            },
+            nb::arg("default_name") = "export.jpg",
+            "Open a save file dialog for JPEG images. Returns empty string if cancelled.");
 
         m.def(
             "save_ply_file_dialog",
@@ -4283,6 +4356,25 @@ namespace lfs::python {
             "Get the currently active tool id from C++ EditorContext");
 
         m.def(
+            "is_tool_available", [](const std::string& id) -> bool {
+                static const std::unordered_map<std::string, vis::ToolType> tool_map = {
+                    {"builtin.select", vis::ToolType::Selection},
+                    {"builtin.translate", vis::ToolType::Translate},
+                    {"builtin.rotate", vis::ToolType::Rotate},
+                    {"builtin.scale", vis::ToolType::Scale},
+                    {"builtin.mirror", vis::ToolType::Mirror},
+                    {"builtin.align", vis::ToolType::Align},
+                };
+                const auto it = tool_map.find(id);
+                if (it == tool_map.end()) {
+                    return false;
+                }
+                const auto* const editor = get_editor_context();
+                return editor && editor->isToolAvailable(it->second);
+            },
+            nb::arg("id"), "Check whether a builtin tool is currently available");
+
+        m.def(
             "set_active_tool", [](const std::string& id) {
                 static const std::unordered_map<std::string, vis::ToolType> tool_map = {
                     {"builtin.select", vis::ToolType::Selection},
@@ -4344,6 +4436,91 @@ namespace lfs::python {
             "Check if an operator is currently active");
 
         m.def(
+            "can_edit_gaussian_selection", []() -> bool {
+                const auto* editor = get_editor_context();
+                return editor && editor->canSelectGaussians();
+            },
+            "Return true when Gaussian selection editing is available");
+
+        m.def(
+            "has_gaussian_selection", []() -> bool {
+                const auto* sm = get_scene_manager();
+                return sm && sm->getScene().hasSelection();
+            },
+            "Return true when any Gaussians are selected");
+
+        m.def(
+            "has_gaussian_clipboard", []() -> bool {
+                const auto* sm = get_scene_manager();
+                return sm && sm->hasGaussianClipboard();
+            },
+            "Return true when copied Gaussians are available for paste");
+
+        m.def(
+            "copy_gaussian_selection", []() {
+                auto* editor = get_editor_context();
+                auto* sm = get_scene_manager();
+                if (!editor || !editor->canSelectGaussians() || !sm || !sm->getScene().hasSelection()) {
+                    return;
+                }
+                sm->copySelectedGaussians();
+            },
+            "Copy selected Gaussians to the internal Gaussian clipboard");
+
+        m.def(
+            "cut_gaussian_selection", []() {
+                auto* editor = get_editor_context();
+                auto* sm = get_scene_manager();
+                if (!editor || !editor->canSelectGaussians() || !sm || !sm->getScene().hasSelection()) {
+                    return;
+                }
+                sm->cutSelectedGaussians();
+            },
+            "Cut selected Gaussians to the internal Gaussian clipboard");
+
+        m.def(
+            "paste_gaussian_selection", []() {
+                auto* editor = get_editor_context();
+                auto* sm = get_scene_manager();
+                if (!editor || !editor->canSelectGaussians() || !sm || !sm->hasGaussianClipboard()) {
+                    return;
+                }
+                sm->pasteSelectionFromClipboard();
+            },
+            "Paste copied Gaussians from the internal Gaussian clipboard");
+
+        m.def(
+            "invert_gaussian_selection", []() {
+                const auto* editor = get_editor_context();
+                if (!editor || !editor->canSelectGaussians()) {
+                    return;
+                }
+                lfs::core::events::cmd::InvertSelection{}.emit();
+            },
+            "Invert the current Gaussian selection");
+
+        m.def(
+            "select_all_gaussians", []() {
+                const auto* editor = get_editor_context();
+                if (!editor || !editor->canSelectGaussians()) {
+                    return;
+                }
+                lfs::core::events::cmd::SelectAll{}.emit();
+            },
+            "Select all editable Gaussians");
+
+        m.def(
+            "deselect_all_gaussians", []() {
+                const auto* editor = get_editor_context();
+                auto* sm = get_scene_manager();
+                if (!editor || !editor->canSelectGaussians() || !sm || !sm->getScene().hasSelection()) {
+                    return;
+                }
+                lfs::core::events::cmd::DeselectAll{}.emit();
+            },
+            "Deselect all selected Gaussians");
+
+        m.def(
             "set_gizmo_type", [](const std::string& type) {
                 if (auto* editor = get_editor_context())
                     editor->setGizmoType(type);
@@ -4368,12 +4545,14 @@ namespace lfs::python {
                 vis::UnifiedToolRegistry::instance().setActiveSubmode(mode);
 
                 static const std::unordered_map<std::string, int> MODE_MAP = {
-                    {"centers", 0},
-                    {"rectangle", 1},
-                    {"polygon", 2},
-                    {"lasso", 3},
-                    {"rings", 4},
-                    {"color", 5}};
+                    {"centers", static_cast<int>(lfs::vis::SelectionSubMode::Centers)},
+                    {"rectangle", static_cast<int>(lfs::vis::SelectionSubMode::Rectangle)},
+                    {"polygon", static_cast<int>(lfs::vis::SelectionSubMode::Polygon)},
+                    {"lasso", static_cast<int>(lfs::vis::SelectionSubMode::Lasso)},
+                    {"rings", static_cast<int>(lfs::vis::SelectionSubMode::Rings)},
+                    {"color", static_cast<int>(lfs::vis::SelectionSubMode::Color)},
+                    {"box", static_cast<int>(lfs::vis::SelectionSubMode::Box)},
+                    {"sphere", static_cast<int>(lfs::vis::SelectionSubMode::Sphere)}};
                 if (const auto it = MODE_MAP.find(mode); it != MODE_MAP.end()) {
                     lfs::core::events::tools::SetSelectionSubMode{.selection_mode = it->second}.emit();
                 }
@@ -4446,6 +4625,26 @@ namespace lfs::python {
                 return "box";
             },
             "Get the active crop tool shape");
+
+        m.def(
+            "set_crop_tool_operation",
+            [](const std::string& operation) {
+                if (auto* const gui = lfs::python::get_gui_manager()) {
+                    gui->gizmo().setCropToolOperation(operation);
+                }
+            },
+            nb::arg("operation"),
+            "Set the active crop or selection-volume gizmo operation: translate, rotate, or scale");
+
+        m.def(
+            "get_crop_tool_operation",
+            []() -> std::string {
+                if (auto* const gui = lfs::python::get_gui_manager()) {
+                    return gui->gizmo().cropToolOperation();
+                }
+                return "translate";
+            },
+            "Get the active crop or selection-volume gizmo operation");
 
         m.def(
             "apply_crop_tool",
@@ -4941,7 +5140,7 @@ namespace lfs::python {
             "register_file_associations", []() -> bool {
                 return lfs::vis::gui::registerFileAssociations();
             },
-            "Register LichtFeld Studio as a supported handler for .ply, .sog, .spz, .usd, .usda, .usdc, .usdz files (Windows only)");
+            "Register LichtFeld Studio as a supported handler for .ply, .sog, .spz, .rad, .usd, .usda, .usdc, .usdz files (Windows only)");
 
         m.def(
             "open_file_association_settings", []() -> bool {
@@ -4953,13 +5152,13 @@ namespace lfs::python {
             "unregister_file_associations", []() -> bool {
                 return lfs::vis::gui::unregisterFileAssociations();
             },
-            "Remove LichtFeld Studio file associations for .ply, .sog, .spz, .usd, .usda, .usdc, .usdz (Windows only)");
+            "Remove LichtFeld Studio file associations for .ply, .sog, .spz, .rad, .usd, .usda, .usdc, .usdz (Windows only)");
 
         m.def(
             "are_file_associations_registered", []() -> bool {
                 return lfs::vis::gui::areFileAssociationsRegistered();
             },
-            "Check if LichtFeld Studio is the default handler for .ply, .sog, .spz, .usd, .usda, .usdc, .usdz (Windows only)");
+            "Check if LichtFeld Studio is the default handler for .ply, .sog, .spz, .rad, .usd, .usda, .usdc, .usdz (Windows only)");
 
         m.def("get_pivot_mode", &get_pivot_mode, "Get pivot mode (0=Origin, 1=Bounds)");
 
@@ -5105,6 +5304,40 @@ namespace lfs::python {
             "set_clipboard_text",
             [](const std::string& text) { SDL_SetClipboardText(text.c_str()); },
             nb::arg("text"), "Copy text to the system clipboard");
+
+        m.def(
+            "has_clipboard_image",
+            []() { return clipboard_has_image(); },
+            "Return True if the system clipboard holds an image");
+
+        m.def(
+            "get_clipboard_image_texture",
+            []() -> nb::tuple {
+                auto [data, w, h, channels] = decode_clipboard_image();
+                if (!data)
+                    return nb::make_tuple(0, 0, 0);
+                const auto [tex_id, width, height] = create_ui_texture_from_data(data, w, h, channels);
+                lfs::core::free_image(data);
+                return nb::make_tuple(tex_id, width, height);
+            },
+            "Read an image from the clipboard as a UI texture, returns (texture_id, width, height)");
+
+        m.def(
+            "save_clipboard_image",
+            [](const std::string& path) {
+                const auto image = decode_clipboard_image();
+                if (!std::get<0>(image))
+                    return false;
+                bool saved = false;
+                try {
+                    saved = lfs::core::save_img_data(lfs::core::utf8_to_path(path), image);
+                } catch (const std::exception& e) {
+                    LOG_WARN("Failed to save clipboard image to {}: {}", path, e.what());
+                }
+                lfs::core::free_image(std::get<0>(image));
+                return saved;
+            },
+            nb::arg("path"), "Decode the clipboard image and write it to path; returns success");
 
         m.def(
             "set_mouse_cursor_hand",
@@ -5266,7 +5499,8 @@ namespace lfs::python {
         }
 
         // Selection sub-mode access (for Python to read C++ toolbar state)
-        m.def("get_selection_submode", &get_selection_submode, "Get current selection sub-mode (0=Brush, 1=Rectangle, 2=Polygon, 3=Lasso, 4=Rings)");
+        m.def("get_selection_submode", &get_selection_submode,
+              "Get current selection sub-mode (0=Centers, 1=Rectangle, 2=Polygon, 3=Lasso, 4=Rings, 5=Color, 6=Box, 7=Sphere)");
 
         // Keyboard capture for popup windows
         m.def("request_keyboard_capture", &request_keyboard_capture, nb::arg("owner_id"), "Request exclusive keyboard capture for a named owner");

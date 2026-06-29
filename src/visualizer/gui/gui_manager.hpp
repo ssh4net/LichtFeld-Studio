@@ -54,6 +54,7 @@ namespace lfs::core {
 namespace lfs::vis {
     class VisualizerImpl;
     class VulkanContext;
+    class WindowManager;
     struct VulkanSceneInteropTarget;
 
     namespace gui {
@@ -77,6 +78,8 @@ namespace lfs::vis {
             void init();
             void shutdown();
             void render();
+            void updateInteractiveTransitions();
+            [[nodiscard]] bool isInteractiveTransitionSettling() const;
             void syncVisiblePanelsBeforeSceneRender();
             void setRmlResizeDeferring(bool defer) { rmlui_manager_.setResizeDeferring(defer); }
 
@@ -128,6 +131,7 @@ namespace lfs::vis {
             [[nodiscard]] bool passiveMouseMoveNeedsRender(float mouse_x, float mouse_y) const;
             [[nodiscard]] bool isStartupVisible() const { return startup_overlay_.isVisible(); }
             void dismissStartupOverlay();
+            void setStartupPluginLoadState(bool active, float progress, const std::string& stage);
             void captureKey(int physical_key, int logical_key, int mods);
             void captureMouseButton(int button, int mods, double x, double y, std::optional<int> chord_key = std::nullopt);
             void captureMouseButtonRelease(int button);
@@ -201,6 +205,11 @@ namespace lfs::vis {
             void loadImGuiSettings();
             void saveImGuiSettings() const;
             void persistImGuiSettingsIfNeeded();
+            void beginImGuiPlatformFrame(WindowManager* window_manager,
+                                         VulkanContext* vulkan_context);
+            [[nodiscard]] bool shouldUseCachedImGuiResizeFrame(
+                const WindowManager* window_manager,
+                const VulkanContext* vulkan_context) const;
             void initCustomCursors();
             void destroyCustomCursors();
             void applyRmlCursorRequest(RmlCursorRequest req);
@@ -226,6 +235,22 @@ namespace lfs::vis {
 
             [[nodiscard]] bool isVramHudOverlayVisible() const;
             [[nodiscard]] bool isVramHudPublishDue(std::chrono::steady_clock::time_point now) const;
+            [[nodiscard]] bool drainVulkanFramesForInteractiveTransition(
+                lfs::vis::WindowManager& window_manager,
+                const char* transition_name);
+            void applyInteractiveTransitionCooldown(
+                std::chrono::steady_clock::time_point& next_allowed_at,
+                std::chrono::steady_clock::time_point now,
+                bool training_active);
+            void queueUiVisibilityToggle();
+            void requestUiVisibilityToggle();
+            void updateUiVisibilityTransition();
+            void queueFullscreenToggle();
+            void requestFullscreenToggle();
+            void updateFullscreenTransition();
+            void beginInteractiveTransitionGuard();
+            void updateInteractiveTransitionGuard();
+            void endInteractiveTransitionGuard();
 
             struct EditorContextUpdateStamp {
                 bool valid = false;
@@ -256,6 +281,13 @@ namespace lfs::vis {
             bool show_vram_hud_ = true;
             bool vram_hud_visible_published_ = false;
             std::chrono::steady_clock::time_point next_vram_hud_publish_{};
+            std::chrono::steady_clock::time_point ui_toggle_next_allowed_at_{};
+            bool ui_toggle_pending_ = false;
+            std::chrono::steady_clock::time_point fullscreen_toggle_next_allowed_at_{};
+            std::chrono::steady_clock::time_point interactive_transition_guard_until_{};
+            bool fullscreen_toggle_pending_ = false;
+            bool fullscreen_target_state_ = false;
+            bool interactive_transition_resume_training_ = false;
             std::optional<AppStore::GTMetricsOverlayConfig> published_gt_metrics_overlay_config_;
             bool menu_labels_synced_ = false;
             std::uint64_t synced_menu_entries_version_ = 0;
@@ -315,6 +347,9 @@ namespace lfs::vis {
 
             // RmlUI integration
             RmlUIManager rmlui_manager_;
+            std::chrono::steady_clock::time_point last_imgui_platform_frame_time_{};
+            std::uint64_t cached_imgui_resize_frame_count_ = 0;
+            bool used_cached_imgui_resize_frame_ = false;
             std::unique_ptr<lfs::vis::VulkanViewportPass> vulkan_viewport_pass_;
             std::vector<std::unique_ptr<VulkanSceneInteropTarget>> vulkan_scene_interop_;
             std::shared_ptr<const lfs::core::Tensor> vulkan_scene_image_;
@@ -367,10 +402,12 @@ namespace lfs::vis {
             float last_ui_layout_scene_ratio_ = -1.0f;
             float last_ui_layout_python_console_w_ = -1.0f;
             float last_ui_layout_bottom_dock_h_ = -1.0f;
+            float last_ui_layout_left_dock_w_ = -1.0f;
             bool last_ui_layout_show_main_panel_ = false;
             bool last_ui_layout_ui_hidden_ = false;
             bool last_ui_layout_python_console_visible_ = false;
             bool last_ui_layout_bottom_dock_visible_ = false;
+            bool last_ui_layout_left_dock_visible_ = false;
             enum class RightPanelPointerRegion : uint8_t {
                 None,
                 Resize,
@@ -382,6 +419,8 @@ namespace lfs::vis {
             RightPanelPointerRegion right_panel_pointer_capture_region_ =
                 RightPanelPointerRegion::None;
             bool bottom_dock_pointer_live_capture_ = false;
+            bool left_dock_pointer_live_capture_ = false;
+            bool dock_resize_interaction_active_ = false;
             std::string last_ui_layout_active_tab_;
             std::uint64_t last_pre_scene_panel_sync_generation_ = 0;
 

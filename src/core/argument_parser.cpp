@@ -193,7 +193,7 @@ namespace {
             ::args::Group mode_group(parser, "MODE SELECTION:");
             ::args::HelpFlag help(mode_group, "help", "Display help menu", {'h', "help"});
             ::args::Flag version(mode_group, "version", "Display version information", {'V', "version"});
-            ::args::ValueFlag<std::string> view_ply(mode_group, "path", "View file(s). Supports splat (.ply, .sog, .spz, .usd, .usda, .usdc, .usdz) and mesh (.obj, .fbx, .gltf, .glb, .stl) formats. If directory, loads all.", {'v', "view"});
+            ::args::ValueFlag<std::string> view_ply(mode_group, "path", "View file(s). Supports splat (.ply, .sog, .spz, .rad, .usd, .usda, .usdc, .usdz) and mesh (.obj, .fbx, .gltf, .glb, .stl) formats. If directory, loads all.", {'v', "view"});
             ::args::ValueFlag<std::string> resume_checkpoint(mode_group, "checkpoint", "Resume training from checkpoint file", {"resume"});
             ::args::CompletionFlag completion(parser, {"complete"});
 
@@ -209,6 +209,7 @@ namespace {
             ::args::ValueFlag<std::string> init_path(paths_group, "path", "Initialize from splat file (.ply, .sog, .spz, .usd, .usda, .usdc, .usdz, .resume)", {"init"});
             ::args::ValueFlagList<std::string> add_splats(paths_group, "path", "Append trained splat file(s) to the training model before optimizer initialization", {"add-splat"});
             ::args::CounterFlag freeze(paths_group, "freeze", "Freeze the immediately preceding --add-splat rows from optimizer gradients and densification", {"freeze"});
+            ::args::Flag exclude_export(paths_group, "exclude_export", "Exclude frozen --add-splat rows from PLY exports", {"exclude-export"});
 
             ::args::ValueFlag<std::string> import_cameras(paths_group, "path", "Import COLMAP cameras from sparse folder (no images required)", {"import-cameras"});
 
@@ -224,9 +225,8 @@ namespace {
             ::args::ValueFlag<int> max_cap(training_group, "max_cap", "Maximum number of Gaussians", {"max-cap"});
             ::args::ValueFlag<float> min_opacity(training_group, "min_opacity", "Minimum opacity threshold", {"min-opacity"});
             ::args::ValueFlag<float> steps_scaler(training_group, "steps_scaler", "Scale training steps by factor", {"steps-scaler"});
-            ::args::ValueFlag<int> tile_mode(training_group, "tile_mode", "Tile mode for 3DGUT memory-efficient training: 1=1 tile, 2=2 tiles, 4=4 tiles (default: 1; ignored for 3DGS/FastGS)", {"tile-mode"});
-            ::args::Flag use_error_map(training_group, "use_error_map", "Weight MRNF refine signal by per-pixel SSIM error map", {"use-error-map"});
-            ::args::Flag use_edge_map(training_group, "use_edge_map", "Weight MRNF refine signal by Sobel edge map on GT images", {"use-edge-map"});
+            ::args::Flag no_error_map(training_group, "no_error_map", "Disable per-pixel SSIM error-map weighting of the MRNF refine signal (default: enabled)", {"no-error-map"});
+            ::args::Flag no_edge_map(training_group, "no_edge_map", "Disable Sobel edge-map weighting of the MRNF refine signal (default: enabled)", {"no-edge-map"});
             ::args::ValueFlag<std::string> bg_mode(training_group, "mode", "Background mode: solidcolor, modulation, image, random (default: solidcolor)", {"bg-mode"});
             ::args::ValueFlag<std::string> bg_color(training_group, "color", "solidcolor background color as #RRGGBB or (R,G,B) with 0-255 channels (default: #000000)", {"bg-color"});
             ::args::ValueFlag<std::string> bg_image_path(training_group, "path", "Background image path (required when --bg-mode image)", {"bg-image-path"});
@@ -269,20 +269,24 @@ namespace {
                                                                      {"by_cameras", "by_cameras"}});
 
             // =============================================================================
-            // MASK OPTIONS
+            // MASK / DEPTH OPTIONS
             // =============================================================================
             ::args::Group mask_sep(parser, " ");
-            ::args::Group mask_group(parser, "MASK OPTIONS:");
+            ::args::Group mask_group(parser, "MASK / DEPTH OPTIONS:");
             ::args::MapFlag<std::string, lfs::core::param::MaskMode> mask_mode(mask_group, "mask_mode",
-                                                                               "Mask mode: none, segment, ignore, alpha_consistent (default: none)",
+                                                                               "Mask mode: none, segment, ignore, segment_and_ignore, alpha_consistent (default: none)",
                                                                                {"mask-mode"},
                                                                                std::unordered_map<std::string, lfs::core::param::MaskMode>{
                                                                                    {"none", lfs::core::param::MaskMode::None},
                                                                                    {"segment", lfs::core::param::MaskMode::Segment},
                                                                                    {"ignore", lfs::core::param::MaskMode::Ignore},
+                                                                                   {"segment_and_ignore", lfs::core::param::MaskMode::SegmentAndIgnore},
                                                                                    {"alpha_consistent", lfs::core::param::MaskMode::AlphaConsistent}});
             ::args::Flag invert_masks(mask_group, "invert_masks", "Invert mask values (swap object/background)", {"invert-masks"});
             ::args::Flag no_alpha_as_mask(mask_group, "no_alpha_as_mask", "Disable automatic alpha-as-mask for RGBA images", {"no-alpha-as-mask"});
+            ::args::Flag use_depth_loss(mask_group, "use_depth_loss", "Load depth maps and enable depth-map supervision", {"use-depth-loss"});
+            ::args::ValueFlag<float> depth_loss_weight(mask_group, "depth_loss_weight", "Depth loss weight (default: 2.0)", {"depth-loss-weight"});
+            ::args::ValueFlag<std::string> depth_loss_mode(mask_group, "depth_loss_mode", "Depth loss mode: pearson, adaptive-warped-l1 (default: adaptive-warped-l1)", {"depth-loss-mode"});
 
             // =============================================================================
             // SPARSITY OPTIMIZATION
@@ -313,8 +317,7 @@ namespace {
             ::args::Group output_sep(parser, " ");
             ::args::Group output_group(parser, "OUTPUT OPTIONS:");
             ::args::Flag enable_eval(output_group, "eval", "Enable evaluation during training", {"eval"});
-            ::args::Flag enable_save_eval_images(output_group, "save_eval_images", "Save evaluation comparison images (GT vs rendered)", {"save-eval-images"});
-            ::args::Flag save_depth(output_group, "save_depth", "[TODO] Save depth maps during training (not yet implemented)", {"save-depth"});
+            ::args::Flag no_save_eval_images(output_group, "no_save_eval_images", "Disable saving of evaluation comparison images (GT vs rendered) during eval (default: enabled)", {"no-save-eval-images"});
             ::args::ValueFlagList<std::string> timelapse_images(output_group, "timelapse_images", "Image filenames to render timelapse images for", {"timelapse-images"});
             ::args::ValueFlag<int> timelapse_every(output_group, "timelapse_every", "Render timelapse image every N iterations (default: 50)", {"timelapse-every"});
 
@@ -425,8 +428,8 @@ namespace {
                         return std::unexpected(std::format("Path does not exist: {}", lfs::core::path_to_utf8(view_path)));
                     }
 
-                    constexpr std::array<std::string_view, 12> SUPPORTED_EXTENSIONS = {
-                        ".ply", ".sog", ".spz", ".resume",
+                    constexpr std::array<std::string_view, 13> SUPPORTED_EXTENSIONS = {
+                        ".ply", ".sog", ".spz", ".rad", ".resume",
                         ".obj", ".fbx", ".gltf", ".glb", ".stl", ".dae", ".3ds", ".blend"};
                     const auto is_supported = [&](const std::filesystem::path& p) {
                         auto ext = p.extension().string();
@@ -603,13 +606,6 @@ namespace {
                 }
             }
 
-            if (tile_mode) {
-                int mode = ::args::get(tile_mode);
-                if (mode != 1 && mode != 2 && mode != 4) {
-                    return std::unexpected("ERROR: --tile-mode must be 1 (1 tile), 2 (2 tiles), or 4 (4 tiles)");
-                }
-            }
-
             // Validate sh_degree (0-3)
             if (sh_degree) {
                 int degree = ::args::get(sh_degree);
@@ -705,13 +701,14 @@ namespace {
                                         strategy_val = cli_option_present({"--strategy"}) ? std::optional<std::string>(::args::get(strategy)) : std::optional<std::string>(),
                                         timelapse_images_val = cli_option_present({"--timelapse-images"}) ? std::optional<std::vector<std::string>>(::args::get(timelapse_images)) : std::optional<std::vector<std::string>>(),
                                         timelapse_every_val = cli_option_present({"--timelapse-every"}) ? std::optional<int>(::args::get(timelapse_every)) : std::optional<int>(),
-                                        tile_mode_val = cli_option_present({"--tile-mode"}) ? std::optional<int>(::args::get(tile_mode)) : std::optional<int>(),
                                         // Sparsity parameters
                                         sparsify_steps_val = cli_option_present({"--sparsify-steps"}) ? std::optional<int>(::args::get(sparsify_steps)) : std::optional<int>(),
                                         init_rho_val = cli_option_present({"--init-rho"}) ? std::optional<float>(::args::get(init_rho)) : std::optional<float>(),
                                         prune_ratio_val = cli_option_present({"--prune-ratio"}) ? std::optional<float>(::args::get(prune_ratio)) : std::optional<float>(),
                                         // Mask parameters
                                         mask_mode_val = cli_option_present({"--mask-mode"}) ? std::optional<lfs::core::param::MaskMode>(::args::get(mask_mode)) : std::optional<lfs::core::param::MaskMode>(),
+                                        depth_loss_weight_val = cli_option_present({"--depth-loss-weight"}) ? std::optional<float>(::args::get(depth_loss_weight)) : std::optional<float>(),
+                                        depth_loss_mode_val = cli_option_present({"--depth-loss-mode"}) ? std::optional<std::string>(::args::get(depth_loss_mode)) : std::optional<std::string>(),
                                         // Python scripts
                                         python_scripts_val = cli_option_present({"--python-script"}) ? std::optional<std::vector<std::string>>(::args::get(python_scripts)) : std::optional<std::vector<std::string>>(),
                                         centralize_val = cli_option_present({"--centralize"}) ? std::optional<std::string>(::args::get(centralize)) : std::optional<std::string>(),
@@ -732,7 +729,7 @@ namespace {
 #endif
                                         debug_python_flag = bool(debug_python),
                                         debug_python_port_val = cli_option_present({"--debug-python-port"}) ? std::optional<int>(::args::get(debug_python_port)) : std::optional<int>(),
-                                        enable_save_eval_images_flag = bool(enable_save_eval_images),
+                                        no_save_eval_images_flag = bool(no_save_eval_images),
                                         bg_mode_val = parsed_bg_mode,
                                         bg_color_val = parsed_bg_color,
                                         bg_image_path_val = cli_option_present({"--bg-image-path"}) ? std::optional<std::string>(::args::get(bg_image_path)) : std::optional<std::string>(),
@@ -742,8 +739,10 @@ namespace {
                                         enable_sparsity_flag = bool(enable_sparsity),
                                         invert_masks_flag = bool(invert_masks),
                                         no_alpha_as_mask_flag = bool(no_alpha_as_mask),
-                                        use_error_map_flag = bool(use_error_map),
-                                        use_edge_map_flag = bool(use_edge_map),
+                                        use_depth_loss_flag = bool(use_depth_loss),
+                                        no_error_map_flag = bool(no_error_map),
+                                        no_edge_map_flag = bool(no_edge_map),
+                                        exclude_export_flag = bool(exclude_export),
                                         output_name_val = cli_option_present({"--output-name"}) ? std::optional<std::string>(::args::get(output_name)) : std::optional<std::string>()]() {
                 auto& opt = params.optimization;
                 auto& svs = params.server;
@@ -784,7 +783,6 @@ namespace {
                 setVal(timelapse_images_val, ds.timelapse_images);
                 setVal(timelapse_every_val, ds.timelapse_every);
                 setVal(output_name_val, ds.output_name);
-                setVal(tile_mode_val, opt.tile_mode);
 
                 // Sparsity parameters
                 setVal(sparsify_steps_val, opt.sparsify_steps);
@@ -809,7 +807,8 @@ namespace {
                 setFlag(no_splash_flag, opt.no_splash);
                 setFlag(debug_python_flag, opt.debug_python);
                 setVal(debug_python_port_val, opt.debug_python_port);
-                setFlag(enable_save_eval_images_flag, opt.enable_save_eval_images);
+                if (no_save_eval_images_flag)
+                    opt.enable_save_eval_images = false;
                 if (bg_mode_val) {
                     opt.bg_mode = *bg_mode_val;
                     opt.bg_modulation = *bg_mode_val == lfs::core::param::BackgroundMode::Modulation;
@@ -825,14 +824,22 @@ namespace {
                 setFlag(gut_flag, opt.gut);
                 setFlag(undistort_flag, opt.undistort);
                 setFlag(enable_sparsity_flag, opt.enable_sparsity);
-                setFlag(use_error_map_flag, opt.use_error_map);
-                setFlag(use_edge_map_flag, opt.use_edge_map);
+                if (no_error_map_flag)
+                    opt.use_error_map = false;
+                if (no_edge_map_flag)
+                    opt.use_edge_map = false;
+                setFlag(exclude_export_flag, params.exclude_frozen_add_splats_from_export);
 
                 // Mask parameters
                 setVal(mask_mode_val, opt.mask_mode);
                 setFlag(invert_masks_flag, opt.invert_masks);
                 if (no_alpha_as_mask_flag)
                     opt.use_alpha_as_mask = false;
+                setFlag(use_depth_loss_flag, opt.use_depth_loss);
+                setVal(depth_loss_weight_val, opt.depth_loss_weight);
+                if (depth_loss_mode_val) {
+                    opt.depth_loss_mode = *depth_loss_mode_val;
+                }
                 // Also propagate to dataset config for loading
                 ds.invert_masks = opt.invert_masks;
                 ds.mask_threshold = opt.mask_threshold;
@@ -1018,32 +1025,6 @@ namespace {
         return formats;
     }
 
-    std::expected<std::vector<float>, std::string> parseLodLevels(const std::string& levels_str) {
-        std::vector<float> levels;
-        size_t start = 0;
-        while (start < levels_str.size()) {
-            size_t end = levels_str.find(',', start);
-            if (end == std::string::npos)
-                end = levels_str.size();
-            std::string token = levels_str.substr(start, end - start);
-            const size_t first = token.find_first_not_of(" \t");
-            const size_t last = token.find_last_not_of(" \t");
-            if (first != std::string::npos && last != std::string::npos) {
-                token = token.substr(first, last - first + 1);
-            }
-            if (!token.empty()) {
-                try {
-                    const float percentage = std::stof(token);
-                    levels.push_back(percentage / 100.0f);
-                } catch (...) {
-                    return std::unexpected(std::format("Invalid LOD level value: '{}'", token));
-                }
-            }
-            start = end + 1;
-        }
-        return levels;
-    }
-
     std::expected<lfs::core::args::ParsedArgs, std::string> parseConvertArgs(const int argc, const char* const argv[]) {
         namespace core_args = lfs::core::args;
         namespace param = lfs::core::param;
@@ -1055,7 +1036,10 @@ namespace {
         ::args::ValueFlag<int> sh_degree(parser, "degree", "SH degree [0-3], -1 to keep original (default: -1)", {"sh-degree"});
         ::args::ValueFlag<std::string> format(parser, "format", "Output format: ply, sog, spz, html, usd, usda, usdc, rad", {'f', "format"});
         ::args::ValueFlag<int> sog_iter(parser, "iterations", "K-means iterations for SOG (default: 10)", {"sog-iterations"});
-        ::args::ValueFlag<std::string> lod_levels(parser, "levels", "LOD levels for RAD format as comma-separated percentages (default: 100)", {"lod-levels"});
+        ::args::ValueFlag<std::string> tiles(parser, "AxB", "Replicate a PLY source across an AxB ground-plane grid (RAD output only)", {"tiles"});
+        ::args::ValueFlag<std::string> lod_builder(parser, "builder", "PLY->RAD LOD tree builder: bhatt (default) or octree (hybrid: octree fine levels + similarity-ordered bhatt top, much faster)", {"lod-builder"});
+        ::args::Flag rad_stream(parser, "stream", "RAD output: streamable Spark-compatible chunks (default)", {"stream"});
+        ::args::Flag rad_none_stream(parser, "none-stream", "RAD output: native LichtFeld chunks", {"none-stream"});
         ::args::Flag overwrite(parser, "overwrite", "Overwrite existing files without prompting", {'y', "overwrite"});
 
         std::vector<std::string> args_vec(argv + 1, argv + argc);
@@ -1091,12 +1075,6 @@ namespace {
             params.output_path = lfs::core::utf8_to_path(::args::get(output));
         if (sog_iter)
             params.sog_iterations = ::args::get(sog_iter);
-        if (lod_levels) {
-            auto levels = parseLodLevels(::args::get(lod_levels));
-            if (!levels)
-                return std::unexpected(levels.error());
-            params.rad_lod_levels = std::move(*levels);
-        }
         params.overwrite = overwrite;
 
         if (format) {
@@ -1112,6 +1090,52 @@ namespace {
                 return std::unexpected(std::format("Unknown extension '{}'. Use --format", params.output_path.extension().string()));
             }
         }
+
+        if (tiles) {
+            const std::string& spec = ::args::get(tiles);
+            const std::size_t sep = spec.find_first_of("xX");
+            std::uint32_t a = 0;
+            std::uint32_t b = 0;
+            bool ok = sep != std::string::npos && sep > 0 && sep + 1 < spec.size();
+            if (ok) {
+                const auto [pa, ea] = std::from_chars(spec.data(), spec.data() + sep, a);
+                const auto [pb, eb] = std::from_chars(spec.data() + sep + 1, spec.data() + spec.size(), b);
+                ok = ea == std::errc{} && eb == std::errc{} &&
+                     pa == spec.data() + sep && pb == spec.data() + spec.size() &&
+                     a > 0 && b > 0;
+            }
+            if (!ok) {
+                return std::unexpected(std::format("Invalid --tiles '{}'. Use AxB, e.g. 3x2", spec));
+            }
+            if (params.format != param::OutputFormat::RAD) {
+                return std::unexpected("--tiles requires RAD output (--format rad)");
+            }
+            params.tiles_x = a;
+            params.tiles_y = b;
+        }
+
+        if (lod_builder) {
+            const std::string& name = ::args::get(lod_builder);
+            if (name == "bhatt") {
+                params.lod_builder = param::LodBuilder::BHATT;
+            } else if (name == "octree") {
+                params.lod_builder = param::LodBuilder::OCTREE;
+            } else {
+                return std::unexpected(std::format("Invalid --lod-builder '{}'. Use: bhatt, octree", name));
+            }
+            if (params.format != param::OutputFormat::RAD) {
+                return std::unexpected("--lod-builder requires RAD output (--format rad)");
+            }
+        }
+
+        if (rad_stream && rad_none_stream) {
+            return std::unexpected("--stream and --none-stream are mutually exclusive");
+        }
+        if ((rad_stream || rad_none_stream) && params.format != param::OutputFormat::RAD) {
+            return std::unexpected("--stream/--none-stream require RAD output (--format rad)");
+        }
+        params.rad_export_mode = rad_none_stream ? param::RadExportMode::NonStream
+                                                 : param::RadExportMode::Stream;
 
         return core_args::ConvertMode{params};
     }
@@ -1129,7 +1153,6 @@ namespace {
         ::args::ValueFlag<int> resolution(parser, "pixels", "Mesh2Splat raster resolution target (default: 1024)", {"resolution"});
         ::args::ValueFlag<float> sigma(parser, "scale", "Gaussian scale sigma (default: 0.65)", {"sigma"});
         ::args::ValueFlag<int> sog_iter(parser, "iterations", "K-means iterations for SOG/HTML output (default: 10)", {"sog-iterations"});
-        ::args::ValueFlag<std::string> lod_levels(parser, "levels", "LOD levels for RAD format as comma-separated percentages (default: 100)", {"lod-levels"});
         ::args::Flag overwrite(parser, "overwrite", "Overwrite existing files without prompting", {'y', "overwrite"});
 
         std::vector<std::string> args_vec(argv + 1, argv + argc);
@@ -1170,12 +1193,6 @@ namespace {
             params.options.sigma = ::args::get(sigma);
         if (sog_iter)
             params.sog_iterations = ::args::get(sog_iter);
-        if (lod_levels) {
-            auto levels = parseLodLevels(::args::get(lod_levels));
-            if (!levels)
-                return std::unexpected(levels.error());
-            params.rad_lod_levels = std::move(*levels);
-        }
         params.overwrite = overwrite;
 
         if (params.options.resolution_target < lfs::core::Mesh2SplatOptions::kMinResolution) {

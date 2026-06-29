@@ -205,7 +205,6 @@ namespace lichtfeld::Strings {
             inline constexpr const char* ITERATIONS = "training.tooltip.iterations";
             inline constexpr const char* MAX_GAUSSIANS = "training.tooltip.max_gaussians";
             inline constexpr const char* SH_DEGREE = "training.tooltip.sh_degree";
-            inline constexpr const char* TILE_MODE = "training.tooltip.tile_mode";
             inline constexpr const char* STEPS_SCALER = "training.tooltip.steps_scaler";
             inline constexpr const char* BILATERAL_GRID = "training.tooltip.bilateral_grid";
             inline constexpr const char* MASK_MODE = "training.tooltip.mask_mode";
@@ -511,6 +510,8 @@ namespace lichtfeld::Strings {
         inline constexpr const char* POLYGON_SELECTION = "toolbar.polygon_selection";
         inline constexpr const char* LASSO_SELECTION = "toolbar.lasso_selection";
         inline constexpr const char* RING_SELECTION = "toolbar.ring_selection";
+        inline constexpr const char* BOX_SELECTION = "toolbar.box_selection";
+        inline constexpr const char* SPHERE_SELECTION = "toolbar.sphere_selection";
         inline constexpr const char* LOCAL_SPACE = "toolbar.local_space";
         inline constexpr const char* WORLD_SPACE = "toolbar.world_space";
         inline constexpr const char* ORIGIN_PIVOT = "toolbar.origin_pivot";
@@ -521,6 +522,7 @@ namespace lichtfeld::Strings {
         inline constexpr const char* MIRROR_Z = "toolbar.mirror_z";
         inline constexpr const char* RESET_DEFAULT = "toolbar.reset_default";
         inline constexpr const char* HOME = "toolbar.home";
+        inline constexpr const char* FOCUS_SELECTION = "toolbar.focus_selection";
         inline constexpr const char* FULLSCREEN = "toolbar.fullscreen";
         inline constexpr const char* TOGGLE_UI = "toolbar.toggle_ui";
         inline constexpr const char* SPLAT_RENDERING = "toolbar.splat_rendering";
@@ -738,7 +740,6 @@ namespace lichtfeld::Strings {
         inline constexpr const char* ITERATIONS = "training_params.iterations";
         inline constexpr const char* MAX_GAUSSIANS = "training_params.max_gaussians";
         inline constexpr const char* SH_DEGREE = "training_params.sh_degree";
-        inline constexpr const char* TILE_MODE = "training_params.tile_mode";
         inline constexpr const char* STEPS_SCALER = "training_params.steps_scaler";
         inline constexpr const char* BILATERAL_GRID = "training_params.bilateral_grid";
         inline constexpr const char* MASK_MODE = "training_params.mask_mode";
@@ -832,6 +833,10 @@ namespace lichtfeld::Strings {
     namespace Startup {
         inline constexpr const char* SUPPORTED_BY = "startup.supported_by";
         inline constexpr const char* CLICK_TO_CONTINUE = "startup.click_to_continue";
+        inline constexpr const char* DISCOVERING_PLUGINS = "startup.discovering_plugins";
+        inline constexpr const char* LOADING_PLUGIN = "startup.loading_plugin";
+        inline constexpr const char* LOADED_PLUGINS = "startup.loaded_plugins";
+        inline constexpr const char* PLUGIN_LOADING_SKIPPED = "startup.plugin_loading_skipped";
         inline constexpr const char* DROP_FILES_TITLE = "startup.drop_files_title";
         inline constexpr const char* DROP_FILES_SUBTITLE = "startup.drop_files_subtitle";
         inline constexpr const char* DROP_FILES_HINT = "startup.drop_files_hint";
@@ -873,7 +878,7 @@ namespace lichtfeld::Strings {
         inline constexpr const char* FPS_LABEL = "video_extractor.fps_label";
         inline constexpr const char* FPS_TOOLTIP = "video_extractor.fps_tooltip";
         inline constexpr const char* EVERY_LABEL = "video_extractor.every_label";
-        inline constexpr const char* FRAMES_FORMAT = "video_extractor.frames_format";
+        inline constexpr const char* FRAMES_UNIT = "video_extractor.frames_unit";
         inline constexpr const char* INTERVAL_TOOLTIP = "video_extractor.interval_tooltip";
         inline constexpr const char* OUTPUT_FORMAT = "video_extractor.output_format";
         inline constexpr const char* FORMAT = "video_extractor.format";
@@ -893,12 +898,14 @@ namespace lichtfeld::Strings {
         inline constexpr const char* PATTERN_TOOLTIP = "video_extractor.pattern_tooltip";
         inline constexpr const char* EXAMPLE = "video_extractor.example";
         inline constexpr const char* START = "video_extractor.start";
+        inline constexpr const char* STOP = "video_extractor.stop";
         inline constexpr const char* CANCEL = "video_extractor.cancel";
         inline constexpr const char* SELECT_BOTH = "video_extractor.select_both";
         inline constexpr const char* EXTRACTING = "video_extractor.extracting";
         inline constexpr const char* STARTING = "video_extractor.starting";
         inline constexpr const char* COMPLETE = "video_extractor.complete";
         inline constexpr const char* EXTRACTED = "video_extractor.extracted";
+        inline constexpr const char* STOPPED = "video_extractor.stopped";
         inline constexpr const char* OK = "video_extractor.ok";
         inline constexpr const char* ERROR_MSG = "video_extractor.error";
         inline constexpr const char* DISMISS = "video_extractor.dismiss";

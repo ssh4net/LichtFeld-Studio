@@ -659,8 +659,16 @@ namespace lfs::core {
                 selected_indices);
         }
 
-        if (splat_data._densification_info.is_valid() && splat_data._densification_info.size(0) == num_points) {
-            splat_data._densification_info = splat_data._densification_info.index_select(0, indices_tensor).contiguous();
+        if (splat_data._densification_info.is_valid()) {
+            if (splat_data._densification_info.ndim() == 1 &&
+                splat_data._densification_info.size(0) == num_points) {
+                splat_data._densification_info =
+                    splat_data._densification_info.index_select(0, indices_tensor).contiguous();
+            } else if (splat_data._densification_info.ndim() == 2 &&
+                       splat_data._densification_info.size(1) == num_points) {
+                splat_data._densification_info =
+                    splat_data._densification_info.index_select(1, indices_tensor).contiguous();
+            }
         }
 
         Tensor scene_center = splat_data._means.mean({0}, false);
@@ -809,6 +817,12 @@ namespace lfs::core {
             splat_data._opacity.index_select(0, indices).contiguous(),
             splat_data._scene_scale);
         result.set_active_sh_degree(splat_data._active_sh_degree);
+
+        // If the mask keeps every gaussian, preserve the LOD tree unchanged.
+        if (count == static_cast<int>(splat_data.size()) && splat_data.lod_tree) {
+            result.lod_tree = std::make_unique<lfs::core::SplatLodTree>(*splat_data.lod_tree);
+        }
+
         return result;
     }
 

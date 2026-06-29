@@ -100,6 +100,7 @@ namespace lfs::vis::gui {
         append(RenderReason::PointerWheel, "pointer_wheel");
         append(RenderReason::PointerDrag, "pointer_drag");
         append(RenderReason::Keyboard, "keyboard");
+        append(RenderReason::LodStats, "lod_stats");
         return sources.empty() ? "unknown" : sources;
     }
 
@@ -124,6 +125,7 @@ namespace lfs::vis::gui {
             document_->Show();
             bindReactiveStore();
             refreshGTMetricsOverlayFromStore();
+            applyLodStatsOverlay();
             if (vram_hud_)
                 vram_hud_->onDocumentLoaded(document_);
         } catch (const std::exception& e) {
@@ -205,6 +207,7 @@ namespace lfs::vis::gui {
             document_->Show();
             applyGTMetricsOverlay();
             applySplitDividerOverlay();
+            applyLodStatsOverlay();
             if (vram_hud_)
                 vram_hud_->onDocumentLoaded(document_);
             updateToolbarRoots();
@@ -294,6 +297,14 @@ namespace lfs::vis::gui {
         screen_origin_ = screen_origin;
     }
 
+    void RmlViewportOverlay::setViewportContentOffset(const float x) {
+        if (std::abs(viewport_content_offset_ - x) > 0.5f) {
+            viewport_content_offset_ = x;
+            viewport_content_offset_dirty_ = true;
+            markRenderNeeded(RenderReason::ViewportResize);
+        }
+    }
+
     void RmlViewportOverlay::setToolbarPanels(const float primary_x,
                                               const float primary_width,
                                               const bool show_secondary,
@@ -350,6 +361,34 @@ namespace lfs::vis::gui {
         gt_metrics_overlay_ = std::move(state);
         applyGTMetricsOverlay();
         markRenderNeeded(RenderReason::GTMetrics);
+    }
+
+    void RmlViewportOverlay::setLodStatsOverlay(LodStatsOverlayState state) {
+        const bool changed =
+            lod_stats_overlay_.visible != state.visible ||
+            std::abs(lod_stats_overlay_.x - state.x) > 0.5f ||
+            std::abs(lod_stats_overlay_.y - state.y) > 0.5f ||
+            lod_stats_overlay_.status_text != state.status_text ||
+            lod_stats_overlay_.selected_text != state.selected_text ||
+            lod_stats_overlay_.budget_text != state.budget_text ||
+            lod_stats_overlay_.model_text != state.model_text ||
+            lod_stats_overlay_.tree_text != state.tree_text ||
+            lod_stats_overlay_.traversal_text != state.traversal_text ||
+            lod_stats_overlay_.stop_text != state.stop_text ||
+            lod_stats_overlay_.chunks_text != state.chunks_text ||
+            lod_stats_overlay_.cache_text != state.cache_text ||
+            lod_stats_overlay_.selector_text != state.selector_text ||
+            lod_stats_overlay_.pixel_text != state.pixel_text ||
+            lod_stats_overlay_.render_text != state.render_text ||
+            lod_stats_overlay_.foveation_text != state.foveation_text ||
+            lod_stats_overlay_.hash_text != state.hash_text;
+        if (!changed) {
+            return;
+        }
+
+        lod_stats_overlay_ = std::move(state);
+        applyLodStatsOverlay();
+        markRenderNeeded(RenderReason::LodStats);
     }
 
     void RmlViewportOverlay::setVramHudOverlay(VramHudOverlayState state) {
@@ -464,6 +503,13 @@ namespace lfs::vis::gui {
                    secondary_toolbar_x_,
                    secondary_toolbar_width_,
                    show_secondary_toolbar_ && secondary_toolbar_width_ > 0.0f);
+        const auto apply_left_toolbar_offset = [&](const char* element_id, const float x) {
+            if (auto* const element = document_->GetElementById(element_id)) {
+                element->SetProperty("left", std::format("{:.1f}px", x));
+            }
+        };
+        apply_left_toolbar_offset("primary-shelf-background", -primary_toolbar_x_);
+        apply_left_toolbar_offset("primary-utility-toolbar", -primary_toolbar_x_);
         applied_primary_toolbar_x_ = primary_toolbar_x_;
         applied_primary_toolbar_width_ = primary_toolbar_width_;
         applied_show_secondary_toolbar_ = show_secondary_toolbar_;
@@ -471,6 +517,15 @@ namespace lfs::vis::gui {
         applied_secondary_toolbar_width_ = secondary_toolbar_width_;
         toolbar_roots_dirty_ = false;
         return true;
+    }
+
+    void RmlViewportOverlay::updateViewportContentOffset() {
+        if (!document_ || !viewport_content_offset_dirty_)
+            return;
+        if (auto* const element = document_->GetElementById("viewport-content")) {
+            element->SetProperty("left", std::format("{:.1f}px", viewport_content_offset_));
+        }
+        viewport_content_offset_dirty_ = false;
     }
 
     void RmlViewportOverlay::applySplitDividerOverlay() {
@@ -518,6 +573,46 @@ namespace lfs::vis::gui {
 
         if (touched)
             markRenderNeeded(RenderReason::GTMetrics);
+    }
+
+    void RmlViewportOverlay::applyLodStatsOverlay() {
+        if (!document_) {
+            return;
+        }
+
+        const auto value_text = [](const std::string& text) -> Rml::String {
+            return text.empty() ? Rml::String("--") : Rml::String(text);
+        };
+        bool touched = false;
+        if (auto* const overlay = document_->GetElementById("lod-stats-overlay")) {
+            overlay->SetClass("hidden", !lod_stats_overlay_.visible);
+            overlay->SetProperty("left", std::format("{:.1f}px", lod_stats_overlay_.x));
+            overlay->SetProperty("top", std::format("{:.1f}px", lod_stats_overlay_.y));
+            touched = true;
+        }
+        const auto set_text = [&](const char* id, const std::string& text) {
+            if (auto* const element = document_->GetElementById(id)) {
+                element->SetInnerRML(value_text(text));
+                touched = true;
+            }
+        };
+        set_text("lod-stats-status", lod_stats_overlay_.status_text);
+        set_text("lod-stats-selected", lod_stats_overlay_.selected_text);
+        set_text("lod-stats-budget", lod_stats_overlay_.budget_text);
+        set_text("lod-stats-model", lod_stats_overlay_.model_text);
+        set_text("lod-stats-tree", lod_stats_overlay_.tree_text);
+        set_text("lod-stats-traversal", lod_stats_overlay_.traversal_text);
+        set_text("lod-stats-stop", lod_stats_overlay_.stop_text);
+        set_text("lod-stats-chunks", lod_stats_overlay_.chunks_text);
+        set_text("lod-stats-cache", lod_stats_overlay_.cache_text);
+        set_text("lod-stats-selector", lod_stats_overlay_.selector_text);
+        set_text("lod-stats-pixel", lod_stats_overlay_.pixel_text);
+        set_text("lod-stats-render", lod_stats_overlay_.render_text);
+        set_text("lod-stats-foveation", lod_stats_overlay_.foveation_text);
+        set_text("lod-stats-hash", lod_stats_overlay_.hash_text);
+
+        if (touched)
+            markRenderNeeded(RenderReason::LodStats);
     }
 
     void RmlViewportOverlay::processInput(const PanelInputState& input) {
@@ -672,7 +767,19 @@ namespace lfs::vis::gui {
             if (is_text_target) {
                 wants_input_ = true;
                 guiFocusState().want_capture_keyboard = true;
+                // Numpad digit and period scancodes must be suppressed from
+                // ProcessKeyDown / ProcessKeyUp when a text input is focused,
+                // otherwise RmlUi treats them as navigation keys (Home, End,
+                // arrows, etc.). The actual digit text arrives via
+                // ProcessTextInput below. This mirrors the fix in
+                // rml_panel_host.cpp for the sidebar text inputs.
+                auto isNumpadTextKey = [](int sc) {
+                    return (sc >= SDL_SCANCODE_KP_1 && sc <= SDL_SCANCODE_KP_0) ||
+                           sc == SDL_SCANCODE_KP_PERIOD;
+                };
                 for (const int sc : input.keys_pressed) {
+                    if (isNumpadTextKey(sc))
+                        continue;
                     const auto rml_key = sdlScancodeToRml(static_cast<SDL_Scancode>(sc));
                     if (rml_key != Rml::Input::KI_UNKNOWN) {
                         markRenderNeeded(RenderReason::Keyboard);
@@ -680,6 +787,8 @@ namespace lfs::vis::gui {
                     }
                 }
                 for (const int sc : input.keys_released) {
+                    if (isNumpadTextKey(sc))
+                        continue;
                     const auto rml_key = sdlScancodeToRml(static_cast<SDL_Scancode>(sc));
                     if (rml_key != Rml::Input::KI_UNKNOWN) {
                         markRenderNeeded(RenderReason::Keyboard);
@@ -759,6 +868,7 @@ namespace lfs::vis::gui {
 
         applyGTMetricsOverlay();
         applySplitDividerOverlay();
+        applyLodStatsOverlay();
         if (vram_hud_)
             vram_hud_->onDocumentLoaded(document_);
     }
@@ -791,7 +901,7 @@ namespace lfs::vis::gui {
             .draw_width = vp_size_.x,
             .draw_height = vp_size_.y,
             .refresh = refresh_cache,
-            .foreground = true,
+            .foreground = false,
             .clip_enabled = true,
             .clip = {
                 .x1 = x,
@@ -869,6 +979,7 @@ namespace lfs::vis::gui {
         const int h = static_cast<int>(vp_size_.y);
         const bool size_changed = (w != last_render_w_ || h != last_render_h_);
         const bool toolbar_changed = updateToolbarRoots();
+        updateViewportContentOffset();
         const bool document_force = theme_changed || size_changed || toolbar_changed;
         bool document_dirty = syncBuiltinDocument(document_force);
         const bool run_prepend_document_hooks = shouldRunDocumentHooks(document_force, true);

@@ -127,7 +127,8 @@ namespace lfs::rendering {
 
     inline constexpr std::size_t kSelectionGroupColorCount = 256;
     inline constexpr std::size_t kSelectionPreviewColorIndex = kSelectionGroupColorCount;
-    inline constexpr std::size_t kSelectionColorTableCount = kSelectionGroupColorCount + 1;
+    inline constexpr std::size_t kSelectionSelectedHoverColorIndex = kSelectionGroupColorCount + 1;
+    inline constexpr std::size_t kSelectionColorTableCount = kSelectionGroupColorCount + 2;
 
     [[nodiscard]] inline std::array<glm::vec4, kSelectionColorTableCount> defaultSelectionColorTable() {
         std::array<glm::vec4, kSelectionColorTableCount> colors{};
@@ -146,6 +147,7 @@ namespace lfs::rendering {
             colors[group] = glm::vec4(palette[(group - 1) % palette.size()], 1.0f);
         }
         colors[kSelectionPreviewColorIndex] = glm::vec4(0.0f, 0.871f, 0.298f, 1.0f);
+        colors[kSelectionSelectedHoverColorIndex] = glm::vec4(1.0f, 0.08f, 0.08f, 1.0f);
         return colors;
     }
 
@@ -154,6 +156,28 @@ namespace lfs::rendering {
         GaussianCursorOverlayState cursor;
         GaussianEmphasisOverlayState emphasis;
         std::array<glm::vec4, kSelectionColorTableCount> selection_colors = defaultSelectionColorTable();
+    };
+
+    struct GaussianLodGpuTraversalState {
+        bool enabled = false;
+        size_t output_capacity = 0;
+        size_t node_count = 0;
+        float pixel_scale_limit = 0.0f;
+        float object_scale = 1.0f;
+        float behind_camera_penalty = 0.2f;
+        float cone_foveation = 0.4f;
+        float cone_inner_degrees = 90.0f;
+        float cone_outer_degrees = 120.0f;
+        float outside_view_foveation = 0.05f;
+        float viewport_half_tan_x = 0.0f;
+        float viewport_half_tan_y = 0.0f;
+        float ortho_half_width = 0.0f;
+        float ortho_half_height = 0.0f;
+        glm::vec3 view_origin{0.0f};
+        glm::vec3 view_forward{0.0f, 0.0f, -1.0f};
+        glm::mat4 object_to_view{1.0f};
+        bool viewport_foveation = true;
+        bool orthographic = false;
     };
 
     struct ViewportRenderRequest {
@@ -173,6 +197,19 @@ namespace lfs::rendering {
         float depth_view_min = DEFAULT_DEPTH_VIEW_MIN;
         float depth_view_max = DEFAULT_DEPTH_VIEW_MAX;
         DepthVisualizationMode depth_visualization_mode = DepthVisualizationMode::Palette;
+
+        // LOD index indirection (optional)
+        const uint32_t* lod_indices = nullptr;
+        const uint32_t* lod_logical_indices = nullptr;
+        const uint32_t* lod_levels = nullptr;
+        const float* lod_weights = nullptr;
+        size_t lod_count = 0;
+        uint64_t lod_selection_hash = 0;
+        uint64_t lod_generation = 0;
+        const uint32_t* lod_touched_chunks = nullptr;
+        size_t lod_touched_chunk_count = 0;
+        GaussianLodGpuTraversalState lod_gpu_traversal;
+        bool lod_debug_mode = false;
     };
 
     struct PointCloudSceneState {

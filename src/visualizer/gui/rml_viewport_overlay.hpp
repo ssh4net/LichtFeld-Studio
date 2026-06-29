@@ -50,6 +50,26 @@ namespace lfs::vis::gui {
             float height = 0.0f;
         };
 
+        struct LodStatsOverlayState {
+            bool visible = false;
+            float x = 52.0f;
+            float y = 54.0f;
+            std::string status_text;
+            std::string selected_text;
+            std::string budget_text;
+            std::string model_text;
+            std::string tree_text;
+            std::string traversal_text;
+            std::string stop_text;
+            std::string chunks_text;
+            std::string cache_text;
+            std::string selector_text;
+            std::string pixel_text;
+            std::string render_text;
+            std::string foveation_text;
+            std::string hash_text;
+        };
+
         using VramHudOverlayState = VramHudOverlay::State;
 
         RmlViewportOverlay();
@@ -60,12 +80,14 @@ namespace lfs::vis::gui {
         void init(RmlUIManager* mgr);
         void shutdown();
         void setViewportBounds(glm::vec2 pos, glm::vec2 size, glm::vec2 screen_origin);
+        void setViewportContentOffset(float x);
         void setToolbarPanels(float primary_x, float primary_width,
                               bool show_secondary = false,
                               float secondary_x = 0.0f,
                               float secondary_width = 0.0f);
         void setSplitDividerOverlay(SplitDividerOverlayState state);
         void setGTMetricsOverlay(GTMetricsOverlayState state);
+        void setLodStatsOverlay(LodStatsOverlayState state);
         void setVramHudOverlay(VramHudOverlayState state);
         bool isDueForVramProcessSample(std::chrono::milliseconds interval);
         void reloadResources();
@@ -88,10 +110,12 @@ namespace lfs::vis::gui {
         void markDocumentSyncDirty();
         bool syncBuiltinDocument(bool force);
         bool updateToolbarRoots();
+        void updateViewportContentOffset();
         void bindReactiveStore();
         void refreshGTMetricsOverlayFromStore();
         void applySplitDividerOverlay();
         void applyGTMetricsOverlay();
+        void applyLodStatsOverlay();
         bool applyFrameTooltip();
         void queueCachedVulkanContext(bool refresh_cache);
         enum class RenderReason : std::uint32_t {
@@ -110,6 +134,7 @@ namespace lfs::vis::gui {
             PointerWheel = 1u << 12,
             PointerDrag = 1u << 13,
             Keyboard = 1u << 14,
+            LodStats = 1u << 15,
         };
         void markRenderNeeded(RenderReason reason);
         [[nodiscard]] std::string renderReasonSources() const;
@@ -133,6 +158,8 @@ namespace lfs::vis::gui {
         float applied_secondary_toolbar_x_ = 0.0f;
         float applied_secondary_toolbar_width_ = -1.0f;
         bool toolbar_roots_dirty_ = true;
+        float viewport_content_offset_ = 0.0f;
+        bool viewport_content_offset_dirty_ = true;
         std::size_t last_theme_signature_ = 0;
         bool has_theme_signature_ = false;
         std::string base_rcss_;
@@ -154,6 +181,7 @@ namespace lfs::vis::gui {
         CachedVulkanContextRender direct_cache_;
         SplitDividerOverlayState split_divider_overlay_;
         GTMetricsOverlayState gt_metrics_overlay_;
+        LodStatsOverlayState lod_stats_overlay_;
         lfs::vis::AppStore::GTMetricsOverlayConfig gt_metrics_config_;
         std::optional<lfs::vis::AppStore::CameraMetrics> camera_metrics_;
         lfs::core::reactive::SubscriptionToken gt_metrics_config_subscription_;

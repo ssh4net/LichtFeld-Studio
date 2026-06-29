@@ -11,6 +11,7 @@
 #include <iterator>
 #include <string>
 #include <variant>
+#include <vector>
 
 namespace {
 
@@ -40,6 +41,7 @@ TEST(ArgumentParserTest, TrainingDefaultsApplyMaxWidthCap) {
     EXPECT_FALSE((*parsed)->cli_bg_color_set);
     EXPECT_EQ((*parsed)->dataset.max_width, 3840);
     EXPECT_EQ((*parsed)->dataset.resize_factor, 1);
+    EXPECT_EQ((*parsed)->optimization.depth_loss_mode, "adaptive-warped-l1");
 }
 
 TEST(ArgumentParserTest, MaxWidthCanBeExplicitlySet) {
@@ -176,6 +178,86 @@ TEST(ArgumentParserTest, TrainingParsesAddSplats) {
     ASSERT_EQ((*parsed)->add_splat_paths.size(), 2u);
     EXPECT_EQ((*parsed)->add_splat_paths[0], splat_a);
     EXPECT_EQ((*parsed)->add_splat_paths[1], splat_b);
+    EXPECT_EQ((*parsed)->add_splat_freeze, (std::vector<bool>{false, false}));
+    EXPECT_FALSE((*parsed)->exclude_frozen_add_splats_from_export);
+}
+
+TEST(ArgumentParserTest, TrainingParsesFrozenAddSplatExcludeExport) {
+    const auto dir = make_test_path("lfs_arg_parser_add_splat_exclude");
+    const auto data_path = std::filesystem::path(dir) / "data";
+    const auto output_path = std::filesystem::path(dir) / "output";
+    const auto splat = std::filesystem::path(dir) / "background.ply";
+    std::filesystem::create_directories(data_path);
+    std::filesystem::create_directories(output_path);
+    std::ofstream(splat).put('\n');
+
+    const std::string data_str = data_path.string();
+    const std::string output_str = output_path.string();
+    const std::string splat_str = splat.string();
+    const char* argv[] = {
+        "LichtFeld-Studio",
+        "--headless",
+        "--data-path",
+        data_str.c_str(),
+        "--output-path",
+        output_str.c_str(),
+        "--add-splat",
+        splat_str.c_str(),
+        "--freeze",
+        "--exclude-export"};
+
+    auto parsed = lfs::core::args::parse_args_and_params(static_cast<int>(std::size(argv)), argv);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error();
+
+    ASSERT_EQ((*parsed)->add_splat_paths.size(), 1u);
+    EXPECT_EQ((*parsed)->add_splat_paths[0], splat);
+    EXPECT_EQ((*parsed)->add_splat_freeze, (std::vector<bool>{true}));
+    EXPECT_TRUE((*parsed)->exclude_frozen_add_splats_from_export);
+}
+
+TEST(ArgumentParserTest, TrainingParsesExplicitDepthLossOptions) {
+    const auto data_path = make_test_path("lfs_arg_parser_depth_loss_data");
+    const auto output_path = make_test_path("lfs_arg_parser_depth_loss_output");
+
+    const char* argv[] = {
+        "LichtFeld-Studio",
+        "--headless",
+        "--data-path",
+        data_path.c_str(),
+        "--output-path",
+        output_path.c_str(),
+        "--use-depth-loss",
+        "--depth-loss-weight",
+        "3.25",
+        "--depth-loss-mode",
+        "adaptive-warped-l1"};
+
+    auto parsed = lfs::core::args::parse_args_and_params(static_cast<int>(std::size(argv)), argv);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error();
+
+    EXPECT_TRUE((*parsed)->optimization.use_depth_loss);
+    EXPECT_FLOAT_EQ((*parsed)->optimization.depth_loss_weight, 3.25f);
+    EXPECT_EQ((*parsed)->optimization.depth_loss_mode, "adaptive-warped-l1");
+}
+
+TEST(ArgumentParserTest, TrainingRejectsLegacyDepthLossAlias) {
+    const auto data_path = make_test_path("lfs_arg_parser_depth_invalid_data");
+    const auto output_path = make_test_path("lfs_arg_parser_depth_invalid_output");
+
+    const char* argv[] = {
+        "LichtFeld-Studio",
+        "--headless",
+        "--data-path",
+        data_path.c_str(),
+        "--output-path",
+        output_path.c_str(),
+        "--use-depth-loss",
+        "--depth-loss-mode",
+        "lod"};
+
+    auto parsed = lfs::core::args::parse_args_and_params(static_cast<int>(std::size(argv)), argv);
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_NE(parsed.error().find("depth_loss_mode must be 'pearson' or 'adaptive-warped-l1'"), std::string::npos);
 }
 
 TEST(ArgumentParserTest, TrainingParsesBackgroundModeModulation) {
